@@ -1,0 +1,91 @@
+version: "3.9"
+
+services:
+  # ─── Infrastructure ─────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: cyberpunk_bot
+      POSTGRES_USER: ${POSTGRES_USER:-botuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-botuser}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── App services ───────────────────────────────────────────────────────────
+  api:
+    build: .
+    restart: unless-stopped
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-botuser}:${POSTGRES_PASSWORD}@db:5432/cyberpunk_bot
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - assets_data:/app/assets
+      - logs_data:/app/logs
+      - ./config:/app/config  # YouTube token file persists
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    restart: unless-stopped
+    command: celery -A scheduler.tasks worker --loglevel=info --concurrency=2 -Q celery
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-botuser}:${POSTGRES_PASSWORD}@db:5432/cyberpunk_bot
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - assets_data:/app/assets
+      - logs_data:/app/logs
+      - ./config:/app/config
+    depends_on:
+      - redis
+      - db
+
+  beat:
+    build: .
+    restart: unless-stopped
+    command: celery -A scheduler.tasks beat --loglevel=info --scheduler celery.beat:PersistentScheduler
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-botuser}:${POSTGRES_PASSWORD}@db:5432/cyberpunk_bot
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - beat_data:/app/celerybeat-schedule
+      - ./config:/app/config
+    depends_on:
+      - redis
+      - db
+
+volumes:
+  redis_data:
+  postgres_data:
+  assets_data:
+  logs_data:
+  beat_data:

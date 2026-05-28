@@ -1,6 +1,6 @@
 # ══════════════════════════════════════════════════════════════════
-#  CyberpunkYouTubeBot — dependencias completas
-#  Inferencia 100% local: MusicGen + Stable Diffusion
+#  CyberpunkYouTubeBot — dependencias
+#  Inferencia 100% local: MusicGen + JuggernautXL Lightning
 #
 #  Instalar en orden:
 #    1. pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
@@ -8,24 +8,20 @@
 #    3. pip install -r requirements.txt
 # ══════════════════════════════════════════════════════════════════
 
-# ─── Web framework ────────────────────────────────────────────────
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
+# ─── Config / validación ──────────────────────────────────────────
 pydantic==2.9.2
 pydantic-settings==2.5.2
 
-# ─── Base de datos ────────────────────────────────────────────────
+# ─── Base de datos (SQLite por defecto) ───────────────────────────
 sqlalchemy==2.0.35
-alembic==1.13.3
 
-# ─── Cola de tareas ───────────────────────────────────────────────
-celery==5.4.0
-redis==5.1.1
+# ─── Scheduler (reemplaza Celery beat) ────────────────────────────
+APScheduler==3.10.4
 
 # ─── MusicGen (Meta AudioCraft) ───────────────────────────────────
 audiocraft
 
-# ─── Stable Diffusion (HuggingFace Diffusers) ─────────────────────
+# ─── Diffusers stack (JuggernautXL Lightning) ─────────────────────
 diffusers>=0.30.0
 transformers>=4.44.0
 accelerate>=0.33.0

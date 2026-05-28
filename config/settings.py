@@ -27,7 +27,6 @@ class Settings(BaseSettings):
 
     # ─── Database ─────────────────────────────────────────────────────────────
     DATABASE_URL: str = Field(default="sqlite:///./cyberpunk_bot.db", alias="DATABASE_URL")
-    REDIS_URL: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
 
     # ─── MusicGen local ───────────────────────────────────────────────────────
     MUSICGEN_MODEL: str = "facebook/musicgen-stereo-medium"      # estéreo nativo, ~4.2GB VRAM en fp16
@@ -86,17 +85,6 @@ class Settings(BaseSettings):
     MUSIC_DURATIONS: list = [600, 1800, 3600]  # 10min, 30min, 1h
     DEFAULT_MUSIC_DURATION: int = 3600
     BPM_RANGE: tuple = (120, 145)
-
-    # ─── Celery ───────────────────────────────────────────────────────────────
-    CELERY_BROKER_URL: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
-    CELERY_RESULT_BACKEND: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
-    CELERY_TASK_SERIALIZER: str = "json"
-    CELERY_TASK_MAX_RETRIES: int = 3
-    CELERY_TASK_RETRY_BACKOFF: int = 60
-
-    # ─── FastAPI ──────────────────────────────────────────────────────────────
-    API_HOST: str = "0.0.0.0"
-    API_PORT: int = 8000
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

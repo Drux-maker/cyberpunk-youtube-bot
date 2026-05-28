@@ -49,9 +49,6 @@ class VideoJob(Base):
     error_message = Column(Text, nullable=True)
     retry_count = Column(Integer, default=0)
 
-    # Celery task IDs for tracking
-    celery_task_id = Column(String(255), nullable=True)
-
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

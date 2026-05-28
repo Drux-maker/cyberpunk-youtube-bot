@@ -80,29 +80,17 @@ def generate_music_task(self, job_id: int) -> dict:
             style = job.style
             duration = job.duration_seconds
 
-        from music_generator import music_service
-        asset_id = asyncio.run(music_service.generate_with_retry(job_id, style, duration))
+        from music_generator.generator import get_music_generator
+        gen = get_music_generator()
+        asset_id = asyncio.run(gen.run_with_retry(job_id, style, duration))
 
         with get_db() as db:
             asset = db.query(MusicAsset).filter(MusicAsset.id == asset_id).first()
-            raw_path = Path(asset.file_path)
+            audio_path = asset.file_path
+            bpm = asset.bpm
 
-        from music_generator.audio_processor import AudioProcessor
-        processed_path = raw_path.parent / f"music_final_{job_id}.mp3"
-        asyncio.run(AudioProcessor.process(raw_path, processed_path, duration))
-
-        audio_info = AudioProcessor.get_audio_info(processed_path)
-
-        with get_db() as db:
-            asset = db.query(MusicAsset).filter(MusicAsset.id == asset_id).first()
-            asset.file_path = str(processed_path)
-            asset.is_processed = True
-            asset.duration_seconds = audio_info["duration_seconds"]
-            asset.loudness_lufs = settings.TARGET_LOUDNESS
-            asset.file_size_mb = audio_info["file_size_mb"]
-
-        logger.info(f"Music ready for job {job_id}: {processed_path}")
-        return {"job_id": job_id, "audio_path": str(processed_path), "bpm": asset.bpm}
+        logger.info(f"Music ready for job {job_id}: {audio_path}")
+        return {"job_id": job_id, "audio_path": audio_path, "bpm": bpm}
 
     except Exception as exc:
         logger.error(f"Music generation failed for job {job_id}: {exc}")
@@ -127,12 +115,12 @@ def generate_visuals_task(self, music_result: dict) -> dict:
             style = job.style
             duration = job.duration_seconds
 
-        from visual_generator import visual_service, Animator
+        from visual_generator.generator import get_visual_generator
         from database.models import VisualAsset
 
-        # Generate base images (more for longer videos)
         n_images = 8 if duration <= 1800 else 12
-        asset_ids = asyncio.run(visual_service.generate_batch(job_id, style, n_images))
+        gen = get_visual_generator()
+        asset_ids = asyncio.run(gen.run_batch(job_id, style, n_images))
 
         with get_db() as db:
             assets = db.query(VisualAsset).filter(VisualAsset.id.in_(asset_ids)).all()

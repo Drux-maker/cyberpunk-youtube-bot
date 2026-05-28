@@ -1,241 +1,203 @@
 """
-Music generation via Suno AI, Udio, or fallback to MusicGen (local HuggingFace).
-Handles polling, retries, and storing results.
+Generación de música con MusicGen (Meta AudioCraft) — inferencia local.
+Modelo: facebook/musicgen-medium (1.5B parámetros, ~4GB VRAM).
+Optimizado para RTX 3060 6GB: fp16, CUDA cache clearing entre clips.
 """
-import asyncio
-import httpx
 import logging
-import time
-import uuid
+import math
+import torch
+import torchaudio
 from pathlib import Path
 from typing import Optional
 
 from config.settings import settings
-from database.models import MusicAsset, MusicStyle, VideoJob
+from database.models import MusicAsset, MusicStyle
 from database.db import get_db
 from music_generator.prompt_engine import build_music_prompt_variations
 
 logger = logging.getLogger(__name__)
 
 
-class SunoClient:
-    """Unofficial Suno API client (via suno-api proxy or official when available)."""
-
-    def __init__(self):
-        self.api_key = settings.SUNO_API_KEY
-        self.base_url = settings.SUNO_API_BASE
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
-    async def generate(self, prompt: str, duration: int = 240) -> dict:
-        """Submit generation job and return task ID."""
-        async with httpx.AsyncClient(timeout=60) as client:
-            payload = {
-                "prompt": prompt,
-                "make_instrumental": True,
-                "wait_audio": False,
-                "duration": min(duration, 240),  # Suno max ~4min per clip
-            }
-            resp = await client.post(
-                f"{self.base_url}/generate",
-                json=payload,
-                headers=self.headers,
-            )
-            resp.raise_for_status()
-            return resp.json()
-
-    async def poll_status(self, task_id: str, max_wait: int = 300) -> dict:
-        """Poll until generation completes or times out."""
-        async with httpx.AsyncClient(timeout=30) as client:
-            start = time.time()
-            while time.time() - start < max_wait:
-                resp = await client.get(
-                    f"{self.base_url}/get?ids={task_id}",
-                    headers=self.headers,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                clips = data if isinstance(data, list) else data.get("data", [])
-                if clips and clips[0].get("status") == "complete":
-                    return clips[0]
-                await asyncio.sleep(10)
-            raise TimeoutError(f"Suno generation timed out after {max_wait}s")
-
-    async def download_audio(self, audio_url: str, dest_path: Path) -> Path:
-        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-            resp = await client.get(audio_url)
-            resp.raise_for_status()
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            dest_path.write_bytes(resp.content)
-        return dest_path
-
-
-class UdioClient:
-    """Udio API client."""
-
-    def __init__(self):
-        self.api_key = settings.UDIO_API_KEY
-        self.base_url = settings.UDIO_API_BASE
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
-    async def generate(self, prompt: str) -> dict:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                f"{self.base_url}/generate-proxy",
-                json={
-                    "prompt": prompt,
-                    "samplerOptions": {"seed": -1},
-                },
-                headers=self.headers,
-            )
-            resp.raise_for_status()
-            return resp.json()
-
-    async def poll_status(self, track_id: str, max_wait: int = 300) -> dict:
-        async with httpx.AsyncClient(timeout=30) as client:
-            start = time.time()
-            while time.time() - start < max_wait:
-                resp = await client.get(
-                    f"{self.base_url}/get-track-by-id?trackId={track_id}",
-                    headers=self.headers,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                if data.get("track", {}).get("finished"):
-                    return data["track"]
-                await asyncio.sleep(10)
-            raise TimeoutError("Udio generation timed out")
-
-    async def download_audio(self, audio_url: str, dest_path: Path) -> Path:
-        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-            resp = await client.get(audio_url)
-            resp.raise_for_status()
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            dest_path.write_bytes(resp.content)
-        return dest_path
-
-
-class MusicGeneratorService:
+class MusicGenerator:
     """
-    Orchestrates music generation:
-    1. Picks best available provider (Suno > Udio > MusicGen)
-    2. Generates clips of max provider duration
-    3. Concatenates clips to reach target duration
-    4. Stores MusicAsset in DB
+    Singleton que carga MusicGen una sola vez por proceso y lo reutiliza.
+    Para clips largos (>30s) genera múltiples clips y los concatena con crossfade.
     """
 
-    MAX_CLIP_DURATION = 240  # seconds per clip (Suno limit)
-
     def __init__(self):
-        self.suno = SunoClient() if settings.SUNO_API_KEY else None
-        self.udio = UdioClient() if settings.UDIO_API_KEY else None
+        self._model = None
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._dtype = torch.float16 if self._device == "cuda" else torch.float32
+        logger.info(f"MusicGenerator — device: {self._device}")
 
-    def _clips_needed(self, duration_seconds: int) -> int:
-        return max(1, -(-duration_seconds // self.MAX_CLIP_DURATION))  # ceiling division
+    def _load(self):
+        if self._model is not None:
+            return
+        from audiocraft.models import MusicGen
+        logger.info(f"Cargando {settings.MUSICGEN_MODEL} (primera vez: descarga ~3GB)…")
+        self._model = MusicGen.get_pretrained(settings.MUSICGEN_MODEL)
+        if self._device == "cuda":
+            self._model = self._model.half()
+        logger.info("MusicGen listo ✅")
 
-    async def _generate_single_clip(self, prompt: str, provider: str) -> tuple[str, dict]:
-        """Returns (audio_url, metadata)."""
-        if provider == "suno" and self.suno:
-            task = await self.suno.generate(prompt, self.MAX_CLIP_DURATION)
-            task_id = task[0]["id"] if isinstance(task, list) else task.get("id")
-            clip = await self.suno.poll_status(task_id)
-            return clip["audio_url"], {"provider": "suno", "clip_id": task_id, "title": clip.get("title", "")}
+    def _set_params(self, duration: int):
+        self._model.set_generation_params(
+            duration=duration,
+            top_k=250,
+            top_p=0.0,
+            temperature=settings.MUSICGEN_TEMPERATURE,
+            cfg_coef=settings.MUSICGEN_CFG_COEF,
+        )
 
-        if provider == "udio" and self.udio:
-            task = await self.udio.generate(prompt)
-            track_id = task.get("track_ids", [None])[0]
-            clip = await self.udio.poll_status(track_id)
-            return clip.get("song_path", clip.get("audio_url")), {"provider": "udio", "clip_id": track_id}
+    def generate_clip(self, prompt: str, duration: int, output_path: Path) -> Path:
+        """Genera un único clip WAV de hasta 30 segundos."""
+        self._load()
+        self._set_params(min(duration, settings.MUSICGEN_CLIP_DURATION))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        raise ValueError(f"Provider '{provider}' unavailable or not configured")
+        logger.info(f"Generando clip {duration}s: {prompt[:80]}…")
+        with torch.cuda.amp.autocast(enabled=self._device == "cuda"):
+            wav = self._model.generate([prompt], progress=True)
 
-    async def generate(
+        wav = wav[0].cpu().float()
+        torchaudio.save(str(output_path), wav, sample_rate=32000)
+        torch.cuda.empty_cache()
+        return output_path
+
+    def generate_long(self, prompt: str, total_seconds: int, output_path: Path) -> Path:
+        """
+        Genera audio de larga duración concatenando clips de 30s con crossfade.
+        Varía el prompt sutilmente en cada clip para evitar repetición.
+        """
+        clip_dur = settings.MUSICGEN_CLIP_DURATION
+        overlap = settings.MUSICGEN_OVERLAP
+        clips_needed = math.ceil(total_seconds / (clip_dur - overlap))
+
+        logger.info(f"Generando {clips_needed} clips de {clip_dur}s → total {total_seconds}s")
+        clip_paths: list[Path] = []
+
+        for i in range(clips_needed):
+            varied = self._vary_prompt(prompt, i, clips_needed)
+            clip_path = output_path.parent / f"_chunk_{output_path.stem}_{i:03d}.wav"
+            self.generate_clip(varied, clip_dur, clip_path)
+            clip_paths.append(clip_path)
+            logger.info(f"  [{i+1}/{clips_needed}] OK")
+
+        import asyncio
+        from music_generator.audio_processor import AudioProcessor
+
+        async def _concat():
+            return await AudioProcessor.concatenate_clips(clip_paths, output_path)
+
+        result = asyncio.run(_concat())
+
+        for p in clip_paths:
+            p.unlink(missing_ok=True)
+
+        return result
+
+    def _vary_prompt(self, base: str, idx: int, total: int) -> str:
+        pos = idx / max(total - 1, 1)
+        if pos < 0.1:
+            return base + ", intro, atmospheric build-up, slow start"
+        elif pos < 0.3:
+            return base + ", building energy, increasing intensity"
+        elif pos < 0.7:
+            return base + ", peak energy, full groove, main section"
+        elif pos < 0.9:
+            return base + ", sustained energy, hypnotic loop"
+        else:
+            return base + ", outro, fading intensity, winding down"
+
+    def vram_usage(self) -> str:
+        if not torch.cuda.is_available():
+            return "CPU"
+        used = torch.cuda.memory_allocated() / 1e9
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        return f"{used:.1f}/{total:.1f}GB"
+
+    async def run(
         self,
         job_id: int,
         style: MusicStyle,
         duration_seconds: int,
         prompt: str,
         bpm: int,
-    ) -> MusicAsset:
-        provider = "suno" if self.suno else ("udio" if self.udio else None)
-        if not provider:
-            raise RuntimeError("No music generation API configured. Set SUNO_API_KEY or UDIO_API_KEY.")
+    ) -> int:
+        """Genera música, procesa audio y guarda MusicAsset. Devuelve asset_id."""
+        from music_generator.audio_processor import AudioProcessor
 
-        clips_needed = self._clips_needed(duration_seconds)
-        clip_paths: list[Path] = []
-        generation_metadata = {"clips": [], "provider": provider}
+        raw_path = settings.MUSIC_DIR / f"raw_{job_id}.wav"
+        settings.MUSIC_DIR.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"Generating {clips_needed} clips for job {job_id} via {provider}")
-
-        for i in range(clips_needed):
-            clip_filename = settings.MUSIC_DIR / f"clip_{job_id}_{i}.mp3"
-            audio_url, clip_meta = await self._generate_single_clip(prompt, provider)
-            if provider == "suno":
-                await self.suno.download_audio(audio_url, clip_filename)
-            else:
-                await self.udio.download_audio(audio_url, clip_filename)
-            clip_paths.append(clip_filename)
-            generation_metadata["clips"].append(clip_meta)
-            logger.info(f"  Clip {i+1}/{clips_needed} downloaded: {clip_filename}")
-
-        # Concatenate clips if more than one
-        final_path = settings.MUSIC_DIR / f"music_raw_{job_id}.mp3"
-        if len(clip_paths) == 1:
-            clip_paths[0].rename(final_path)
+        if duration_seconds <= settings.MUSICGEN_CLIP_DURATION:
+            self.generate_clip(prompt, duration_seconds, raw_path)
         else:
-            from music_generator.audio_processor import AudioProcessor
-            final_path = await AudioProcessor.concatenate_clips(clip_paths, final_path)
-            for p in clip_paths:
-                p.unlink(missing_ok=True)
+            self.generate_long(prompt, duration_seconds, raw_path)
+
+        processed_path = settings.MUSIC_DIR / f"music_{job_id}.mp3"
+        await AudioProcessor.process(raw_path, processed_path, duration_seconds)
+        raw_path.unlink(missing_ok=True)
+
+        info = AudioProcessor.get_audio_info(processed_path)
 
         with get_db() as db:
             asset = MusicAsset(
                 job_id=job_id,
-                provider=provider,
+                provider="musicgen-local",
                 prompt=prompt,
-                file_path=str(final_path),
+                file_path=str(processed_path),
                 bpm=float(bpm),
-                generation_metadata=generation_metadata,
+                duration_seconds=info["duration_seconds"],
+                file_size_mb=info["file_size_mb"],
+                sample_rate=settings.AUDIO_SAMPLE_RATE,
+                loudness_lufs=settings.TARGET_LOUDNESS,
+                is_processed=True,
+                generation_metadata={"model": settings.MUSICGEN_MODEL, "device": self._device},
             )
             db.add(asset)
             db.flush()
             asset_id = asset.id
 
-        logger.info(f"MusicAsset {asset_id} saved for job {job_id}")
+        logger.info(f"MusicAsset {asset_id} guardado ({processed_path.stat().st_size / 1e6:.1f}MB)")
         return asset_id
 
-    async def generate_with_retry(
+    async def run_with_retry(
         self,
         job_id: int,
         style: MusicStyle,
         duration_seconds: int,
     ) -> int:
-        """Tries multiple prompt variations before failing."""
+        """Prueba hasta 3 variaciones de prompt antes de fallar."""
+        import asyncio
         variations = build_music_prompt_variations(style, duration_seconds, count=3)
         last_error = None
 
-        for attempt, variation in enumerate(variations):
+        for attempt, v in enumerate(variations):
             try:
-                logger.info(f"Music generation attempt {attempt + 1}/3 for job {job_id}")
-                asset_id = await self.generate(
+                logger.info(f"Intento {attempt + 1}/3 — BPM {v['bpm']}")
+                return await self.run(
                     job_id=job_id,
                     style=style,
                     duration_seconds=duration_seconds,
-                    prompt=variation["prompt"],
-                    bpm=variation["bpm"],
+                    prompt=v["prompt"],
+                    bpm=v["bpm"],
                 )
-                return asset_id
-            except Exception as e:
-                last_error = e
-                logger.warning(f"Attempt {attempt + 1} failed: {e}")
-                await asyncio.sleep(30)
+            except Exception as exc:
+                last_error = exc
+                logger.warning(f"Intento {attempt + 1} fallido: {exc}")
+                torch.cuda.empty_cache()
+                await asyncio.sleep(5)
 
-        raise RuntimeError(f"All music generation attempts failed. Last error: {last_error}")
+        raise RuntimeError(f"Todos los intentos de generación fallaron: {last_error}")
 
 
-music_service = MusicGeneratorService()
+# Singleton — una instancia por proceso worker
+_instance: Optional[MusicGenerator] = None
+
+
+def get_music_generator() -> MusicGenerator:
+    global _instance
+    if _instance is None:
+        _instance = MusicGenerator()
+    return _instance

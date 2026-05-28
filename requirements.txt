@@ -1,44 +1,54 @@
-# ─── Web framework ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+#  CyberpunkYouTubeBot — dependencias completas
+#  Inferencia 100% local: MusicGen + Stable Diffusion
+#
+#  Instalar en orden:
+#    1. pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#    2. pip install xformers --index-url https://download.pytorch.org/whl/cu121
+#    3. pip install -r requirements.txt
+# ══════════════════════════════════════════════════════════════════
+
+# ─── Web framework ────────────────────────────────────────────────
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 pydantic==2.9.2
 pydantic-settings==2.5.2
 
-# ─── Database ─────────────────────────────────────────────────────────────────
+# ─── Base de datos ────────────────────────────────────────────────
 sqlalchemy==2.0.35
 alembic==1.13.3
-psycopg2-binary==2.9.9
 
-# ─── Task queue ───────────────────────────────────────────────────────────────
+# ─── Cola de tareas ───────────────────────────────────────────────
 celery==5.4.0
 redis==5.1.1
-kombu==5.3.7
 
-# ─── HTTP clients ─────────────────────────────────────────────────────────────
-httpx==0.27.2
-aiohttp==3.10.9
+# ─── MusicGen (Meta AudioCraft) ───────────────────────────────────
+audiocraft
 
-# ─── AI APIs ──────────────────────────────────────────────────────────────────
-openai==1.51.2
-anthropic==0.37.1
+# ─── Stable Diffusion (HuggingFace Diffusers) ─────────────────────
+diffusers>=0.30.0
+transformers>=4.44.0
+accelerate>=0.33.0
+safetensors>=0.4.4
+# xformers — instalar por separado con el index de CUDA (ver arriba)
 
-# ─── Audio processing ─────────────────────────────────────────────────────────
+# ─── Audio ────────────────────────────────────────────────────────
+torchaudio          # viene con el install de PyTorch
 pyloudnorm==0.1.1
 soundfile==0.12.1
 numpy==1.26.4
-scipy==1.14.1
-pydub==0.25.1
 
-# ─── Image processing ─────────────────────────────────────────────────────────
+# ─── Imagen / Thumbnails ──────────────────────────────────────────
 Pillow==10.4.0
 
-# ─── YouTube ──────────────────────────────────────────────────────────────────
+# ─── YouTube API ──────────────────────────────────────────────────
 google-api-python-client==2.149.0
 google-auth-httplib2==0.2.0
 google-auth-oauthlib==1.2.1
 google-auth==2.35.0
 
-# ─── Utilities ────────────────────────────────────────────────────────────────
+# ─── OpenAI (solo SEO — opcional) ────────────────────────────────
+openai==1.51.2
+
+# ─── Utilidades ───────────────────────────────────────────────────
 python-dotenv==1.0.1
-structlog==24.4.0
-tenacity==9.0.0

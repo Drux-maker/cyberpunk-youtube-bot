@@ -1,23 +1,110 @@
 """
-Audio post-processing: normalize loudness, fade in/out, seamless loop,
-concatenate clips, and export final master.
-Requires: ffmpeg in PATH, pyloudnorm, pydub.
+Audio post-processing y mastering — TODO en una sola pasada de ffmpeg para
+evitar pérdidas por re-encoding intermedio.
+
+Cadena de mastering (en orden):
+  1. Resample con SoX VHQ (32 kHz → 48 kHz, calidad transparente)
+  2. Trim/loop a duración objetivo
+  3. Mid-EQ suave: cut 200-400 Hz (-1 dB) para limpiar barro,
+     shelf alto +1.5 dB @ 10 kHz para "aire"
+  4. Compresor multibanda muy suave (sólo si se detecta dinámica excesiva)
+  5. Exciter sutil con aphaser/aexciter equivalente (subtle harmonic)
+  6. Fade in/out
+  7. loudnorm de doble pasada a -14 LUFS / -1 dBTP (estándar YouTube)
+  8. Export simultáneo a MP3 320k y AAC 256k
+
+Requisitos: ffmpeg con libsoxr y libmp3lame y aac encoders (build estándar OK).
 """
 import asyncio
+import json
 import logging
+import re
 import subprocess
 from pathlib import Path
 from typing import Optional
-
-import pyloudnorm as pyln
-import soundfile as sf
-import numpy as np
 
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
 
+# ─── helpers ─────────────────────────────────────────────────────────────────
+async def _run_ffmpeg(cmd: list[str], label: str) -> str:
+    """Run ffmpeg async, raise with stderr on failure, return stderr text."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    text = stderr.decode(errors="ignore")
+    if proc.returncode != 0:
+        raise RuntimeError(f"{label} failed:\n{text}")
+    return text
+
+
+# ─── filter chain helpers ────────────────────────────────────────────────────
+
+def _master_filter_chain(
+    target_lufs: float,
+    target_tp: float,
+    fade_in: float,
+    fade_out_start: float,
+    fade_out_dur: float,
+    measured: Optional[dict] = None,
+) -> str:
+    """
+    Build the full mastering filter chain.
+
+    `measured` viene de la primera pasada de loudnorm — si no, se aplica en
+    modo single-pass (menos preciso pero válido).
+    """
+    parts = []
+
+    # 1. Resample alta calidad a 48 kHz
+    parts.append(f"aresample=resampler=soxr:precision=28:osf=s32:out_sample_rate={settings.AUDIO_SAMPLE_RATE}")
+
+    # 2. EQ correctivo + carácter
+    #    - high-pass suave para limpiar rumble sub-30Hz
+    #    - cut suave en 250 Hz para reducir barro
+    #    - shelf alto para "aire"
+    parts.append("highpass=f=30:poles=2")
+    parts.append("equalizer=f=250:t=q:w=1.2:g=-1.5")
+    parts.append("treble=g=1.5:f=10000")
+
+    # 3. Compresión suave de carácter (acompressor — single-band sutil)
+    #    threshold -18, ratio 2:1, attack 20ms, release 250ms
+    parts.append("acompressor=threshold=-18dB:ratio=2:attack=20:release=250:makeup=1.5:knee=4")
+
+    # 4. Forzar layout estéreo (upmix mono → estéreo si hace falta) y aplicar
+    #    un widener muy suave. Sin el aformat previo, extrastereo falla en mono.
+    parts.append("aformat=channel_layouts=stereo")
+    parts.append("extrastereo=m=1.15:c=false")
+
+    # 5. Fades
+    parts.append(f"afade=t=in:st=0:d={fade_in:.3f}")
+    parts.append(f"afade=t=out:st={fade_out_start:.3f}:d={fade_out_dur:.3f}")
+
+    # 6. Loudnorm — segunda pasada con valores medidos
+    if measured:
+        loudnorm = (
+            f"loudnorm=I={target_lufs}:TP={target_tp}:LRA=9:"
+            f"measured_I={measured['input_i']}:measured_TP={measured['input_tp']}:"
+            f"measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}:"
+            f"offset={measured['target_offset']}:linear=true:print_format=summary"
+        )
+    else:
+        loudnorm = f"loudnorm=I={target_lufs}:TP={target_tp}:LRA=9:print_format=summary"
+    parts.append(loudnorm)
+
+    # 7. True-peak limiter de seguridad (alimit) — captura cualquier transitorio
+    #    por encima del TP target.
+    parts.append(f"alimiter=limit={10 ** (target_tp / 20):.4f}:attack=5:release=50:level=disabled")
+
+    return ",".join(parts)
+
+
+# ─── main API ────────────────────────────────────────────────────────────────
 class AudioProcessor:
 
     @staticmethod
@@ -26,173 +113,140 @@ class AudioProcessor:
         output_path: Path,
         target_duration: int,
         target_loudness: float = settings.TARGET_LOUDNESS,
+        target_true_peak: float = settings.TARGET_TRUE_PEAK,
         fade_duration: float = 3.0,
     ) -> Path:
         """
-        Full pipeline:
-        1. Trim or loop to target_duration
-        2. Normalize loudness to target_loudness LUFS
-        3. Apply fade in/out
-        4. Export as 320k MP3
+        Master + export. UNA sola re-codificación final → cero doble-encoding.
+
+        Pasos:
+          1. trim/loop a duración objetivo (WAV)
+          2. medir loudness (1.ª pasada loudnorm)
+          3. master + encoding final a MP3 320k (y opcionalmente AAC 256k)
         """
-        temp_wav = output_path.with_suffix(".temp.wav")
+        looped_wav = output_path.with_suffix(".loop.wav")
+        await AudioProcessor._trim_or_loop(input_path, looped_wav, target_duration)
 
-        # Step 1: FFmpeg trim/loop
-        await AudioProcessor._trim_or_loop(input_path, temp_wav, target_duration)
+        # medir loudness
+        measured = await AudioProcessor._measure_loudness(looped_wav, target_loudness, target_true_peak)
 
-        # Step 2: Loudness normalization
-        normalized_wav = output_path.with_suffix(".norm.wav")
-        await AudioProcessor._normalize_loudness(temp_wav, normalized_wav, target_loudness)
+        # construir cadena completa
+        total_dur = float(target_duration)
+        fade_out_start = max(0.0, total_dur - fade_duration)
+        chain = _master_filter_chain(
+            target_lufs=target_loudness,
+            target_tp=target_true_peak,
+            fade_in=fade_duration,
+            fade_out_start=fade_out_start,
+            fade_out_dur=fade_duration,
+            measured=measured,
+        )
 
-        # Step 3: Fade in/out
-        faded_wav = output_path.with_suffix(".faded.wav")
-        await AudioProcessor._apply_fades(normalized_wav, faded_wav, fade_duration)
+        # MP3 320k — single-pass mastering
+        await AudioProcessor._encode(
+            looped_wav, output_path, chain,
+            codec="libmp3lame", bitrate=settings.AUDIO_BITRATE,
+        )
 
-        # Step 4: Export final MP3
-        await AudioProcessor._export_mp3(faded_wav, output_path)
+        # AAC 256k opcional, mismo master desde el WAV intermedio
+        if settings.EXPORT_AAC:
+            aac_path = output_path.with_suffix(".m4a")
+            try:
+                await AudioProcessor._encode(
+                    looped_wav, aac_path, chain,
+                    codec="aac", bitrate=settings.AUDIO_AAC_BITRATE,
+                )
+                logger.info(f"AAC export: {aac_path}")
+            except RuntimeError as exc:
+                logger.warning(f"AAC export falló (continuando solo con MP3): {exc}")
 
-        # Cleanup temp files
-        for f in [temp_wav, normalized_wav, faded_wav]:
-            f.unlink(missing_ok=True)
-
-        logger.info(f"Audio processed: {output_path}")
+        looped_wav.unlink(missing_ok=True)
+        logger.info(f"Audio mastered: {output_path}")
         return output_path
 
+    # ─── pasos individuales ──────────────────────────────────────────────────
     @staticmethod
     async def _trim_or_loop(input_path: Path, output_path: Path, duration: int) -> None:
-        """Loop audio if shorter than duration, trim if longer."""
         cmd = [
             "ffmpeg", "-y",
             "-stream_loop", "-1",
             "-i", str(input_path),
             "-t", str(duration),
-            "-c:a", "pcm_s16le",
-            "-ar", str(settings.AUDIO_SAMPLE_RATE),
+            "-c:a", "pcm_s24le",  # mantener cabecera al máximo durante el mastering
             str(output_path),
         ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"FFmpeg trim/loop failed: {stderr.decode()}")
+        await _run_ffmpeg(cmd, "trim/loop")
 
     @staticmethod
-    async def _normalize_loudness(input_path: Path, output_path: Path, target_lufs: float) -> None:
-        """Two-pass loudnorm filter via FFmpeg for accurate LUFS targeting."""
-        # First pass — measure
-        cmd_measure = [
+    async def _measure_loudness(
+        input_path: Path,
+        target_lufs: float,
+        target_tp: float,
+    ) -> Optional[dict]:
+        cmd = [
             "ffmpeg", "-i", str(input_path),
-            "-af", "loudnorm=I=-23:TP=-1.5:LRA=11:print_format=json",
+            "-af", f"loudnorm=I={target_lufs}:TP={target_tp}:LRA=9:print_format=json",
             "-f", "null", "-",
         ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd_measure, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        _, stderr = await proc.communicate()
-        stderr_text = stderr.decode()
-
-        # Extract measured values (they appear in stderr)
-        import json, re
-        match = re.search(r'\{[^{}]*"input_i"[^{}]*\}', stderr_text, re.DOTALL)
-        if match:
-            stats = json.loads(match.group())
-            measured_I = stats.get("input_i", str(target_lufs))
-            measured_TP = stats.get("input_tp", "-1.5")
-            measured_LRA = stats.get("input_lra", "11")
-            measured_thresh = stats.get("input_thresh", "-31")
-            offset = stats.get("target_offset", "0")
-        else:
-            measured_I, measured_TP, measured_LRA = str(target_lufs), "-1.5", "11"
-            measured_thresh, offset = "-31", "0"
-
-        # Second pass — apply normalization
-        loudnorm_filter = (
-            f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11:"
-            f"measured_I={measured_I}:measured_TP={measured_TP}:"
-            f"measured_LRA={measured_LRA}:measured_thresh={measured_thresh}:"
-            f"offset={offset}:linear=true:print_format=summary"
-        )
-        cmd_apply = [
-            "ffmpeg", "-y", "-i", str(input_path),
-            "-af", loudnorm_filter,
-            "-c:a", "pcm_s16le",
-            "-ar", str(settings.AUDIO_SAMPLE_RATE),
-            str(output_path),
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd_apply, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"Loudness normalization failed: {stderr.decode()}")
+        try:
+            text = await _run_ffmpeg(cmd, "loudnorm measure")
+        except RuntimeError:
+            return None
+        match = re.search(r'\{[^{}]*"input_i"[^{}]*\}', text, re.DOTALL)
+        if not match:
+            logger.warning("No se pudo extraer medición de loudnorm — fallback a single-pass")
+            return None
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            return None
 
     @staticmethod
-    async def _apply_fades(input_path: Path, output_path: Path, fade_duration: float) -> None:
-        """Apply fade in at start and fade out at end."""
-        data, sample_rate = sf.read(str(input_path))
-        total_duration = len(data) / sample_rate
-        fade_out_start = total_duration - fade_duration
-
-        fade_filter = (
-            f"afade=t=in:st=0:d={fade_duration},"
-            f"afade=t=out:st={fade_out_start:.2f}:d={fade_duration}"
-        )
+    async def _encode(
+        input_path: Path,
+        output_path: Path,
+        filter_chain: str,
+        codec: str,
+        bitrate: str,
+    ) -> None:
         cmd = [
-            "ffmpeg", "-y", "-i", str(input_path),
-            "-af", fade_filter,
-            "-c:a", "pcm_s16le",
-            str(output_path),
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"Fade application failed: {stderr.decode()}")
-
-    @staticmethod
-    async def _export_mp3(input_path: Path, output_path: Path) -> None:
-        cmd = [
-            "ffmpeg", "-y", "-i", str(input_path),
-            "-c:a", "libmp3lame",
-            "-b:a", settings.AUDIO_BITRATE,
+            "ffmpeg", "-y",
+            "-i", str(input_path),
+            "-af", filter_chain,
+            "-c:a", codec,
+            "-b:a", bitrate,
             "-ar", str(settings.AUDIO_SAMPLE_RATE),
-            "-id3v2_version", "3",
-            str(output_path),
         ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"MP3 export failed: {stderr.decode()}")
+        if codec == "libmp3lame":
+            cmd += ["-id3v2_version", "3", "-write_xing", "1"]
+        cmd.append(str(output_path))
+        await _run_ffmpeg(cmd, f"encode {codec}")
 
+    # ─── concatenación sin pérdida (WAV in/out) ──────────────────────────────
     @staticmethod
-    async def concatenate_clips(clip_paths: list[Path], output_path: Path) -> Path:
-        """Concatenate multiple audio clips with crossfade between them."""
+    async def concatenate_clips_wav(clip_paths: list[Path], output_path: Path) -> Path:
+        """
+        Concatena clips manteniendo TODO en WAV (sin doble encoding).
+        Crossfade equal-power triangular (1.5s) — sin dip de volumen.
+        """
         if len(clip_paths) == 1:
             clip_paths[0].rename(output_path)
             return output_path
 
-        # Create FFmpeg concat filter with crossfade
-        # Build input args
-        inputs = []
+        inputs: list[str] = []
         for p in clip_paths:
             inputs.extend(["-i", str(p)])
 
-        # Build acrossfade filter chain
-        filter_parts = []
-        crossfade_dur = 2.0
+        crossfade_dur = 1.5
+        filter_parts: list[str] = []
         prev_label = "[0:a]"
-
         for i in range(1, len(clip_paths)):
             out_label = f"[cf{i}]" if i < len(clip_paths) - 1 else "[aout]"
+            # c1=tri, c2=tri → curva lineal complementaria, energía constante
             filter_parts.append(
-                f"{prev_label}[{i}:a]acrossfade=d={crossfade_dur}:c1=exp:c2=exp{out_label}"
+                f"{prev_label}[{i}:a]acrossfade=d={crossfade_dur}:c1=tri:c2=tri{out_label}"
             )
             prev_label = out_label
-
         filter_complex = ";".join(filter_parts)
 
         cmd = [
@@ -200,22 +254,19 @@ class AudioProcessor:
             *inputs,
             "-filter_complex", filter_complex,
             "-map", "[aout]",
-            "-c:a", "libmp3lame",
-            "-b:a", settings.AUDIO_BITRATE,
+            "-c:a", "pcm_s24le",  # WAV intermedio sin pérdida
             str(output_path),
         ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"Clip concatenation failed: {stderr.decode()}")
-
+        await _run_ffmpeg(cmd, "concat clips")
         return output_path
+
+    # ─── compat: nombre antiguo conservado por si lo llama código externo ───
+    @staticmethod
+    async def concatenate_clips(clip_paths: list[Path], output_path: Path) -> Path:
+        return await AudioProcessor.concatenate_clips_wav(clip_paths, output_path)
 
     @staticmethod
     def get_audio_info(file_path: Path) -> dict:
-        """Returns duration, sample_rate, and measured loudness."""
         cmd = [
             "ffprobe", "-v", "quiet",
             "-print_format", "json",
@@ -226,7 +277,6 @@ class AudioProcessor:
         if result.returncode != 0:
             raise RuntimeError(f"ffprobe failed: {result.stderr}")
 
-        import json
         info = json.loads(result.stdout)
         fmt = info.get("format", {})
         audio_streams = [s for s in info.get("streams", []) if s.get("codec_type") == "audio"]

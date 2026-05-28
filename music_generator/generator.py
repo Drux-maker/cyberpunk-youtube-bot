@@ -1,7 +1,15 @@
 """
 Generación de música con MusicGen (Meta AudioCraft) — inferencia local.
-Modelo: facebook/musicgen-medium (1.5B parámetros, ~4GB VRAM).
-Optimizado para RTX 3060 6GB: fp16, CUDA cache clearing entre clips.
+
+Mejoras de calidad clave respecto a la versión previa:
+  1. Modelo estéreo (musicgen-stereo-medium) con fallback automático a mono
+     si hay OOM de VRAM.
+  2. Long-form COHERENTE mediante generate_continuation(): cada clip ve los
+     últimos N segundos del clip anterior → no más "audio collage".
+  3. CFG dinámico (más libre en intro, más estricto en cuerpo) → resultados
+     menos genéricos.
+  4. Sin doble codificación MP3 — la concatenación queda en WAV y el master
+     final hace una única pasada de encoding.
 """
 import logging
 import math
@@ -13,101 +21,208 @@ from typing import Optional
 from config.settings import settings
 from database.models import MusicAsset, MusicStyle
 from database.db import get_db
-from music_generator.prompt_engine import build_music_prompt_variations
+from music_generator.prompt_engine import (
+    build_music_prompt_variations,
+    build_music_prompt,
+    section_for_position,
+    sample_track_identity,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class MusicGenerator:
-    """
-    Singleton que carga MusicGen una sola vez por proceso y lo reutiliza.
-    Para clips largos (>30s) genera múltiples clips y los concatena con crossfade.
-    """
+    """Singleton: una sola carga del modelo por proceso."""
 
     def __init__(self):
         self._model = None
+        self._model_name: Optional[str] = None
+        self._is_stereo: bool = False
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._dtype = torch.float16 if self._device == "cuda" else torch.float32
         logger.info(f"MusicGenerator — device: {self._device}")
 
-    def _load(self):
+    # ─── carga del modelo ────────────────────────────────────────────────────
+    def _load_model(self, model_name: str) -> None:
+        from audiocraft.models import MusicGen
+        logger.info(f"Cargando {model_name} (puede descargar varios GB la primera vez)…")
+        self._model = MusicGen.get_pretrained(model_name)
+        if self._device == "cuda":
+            self._model.lm.half()
+            self._model.compression_model.half()
+        self._model_name = model_name
+        self._is_stereo = "stereo" in model_name.lower()
+        logger.info(f"Modelo listo — {'stereo' if self._is_stereo else 'mono'}")
+
+    def _load(self) -> None:
         if self._model is not None:
             return
-        from audiocraft.models import MusicGen
-        logger.info(f"Cargando {settings.MUSICGEN_MODEL} (primera vez: descarga ~3GB)…")
-        self._model = MusicGen.get_pretrained(settings.MUSICGEN_MODEL)
-        if self._device == "cuda":
-            self._model = self._model.half()
-        logger.info("MusicGen listo ✅")
+        try:
+            self._load_model(settings.MUSICGEN_MODEL)
+        except torch.cuda.OutOfMemoryError:
+            logger.warning("OOM con modelo estéreo — fallback a mono")
+            self._model = None
+            torch.cuda.empty_cache()
+            self._load_model(settings.MUSICGEN_FALLBACK_MODEL)
+        except Exception as exc:
+            logger.warning(f"Error cargando modelo principal ({exc}) — fallback a mono")
+            self._model = None
+            torch.cuda.empty_cache()
+            self._load_model(settings.MUSICGEN_FALLBACK_MODEL)
 
-    def _set_params(self, duration: int):
+    def _set_params(self, duration: int, cfg_coef: float) -> None:
         self._model.set_generation_params(
             duration=duration,
-            top_k=250,
-            top_p=0.0,
+            top_k=settings.MUSICGEN_TOP_K,
+            top_p=settings.MUSICGEN_TOP_P,
             temperature=settings.MUSICGEN_TEMPERATURE,
-            cfg_coef=settings.MUSICGEN_CFG_COEF,
+            cfg_coef=cfg_coef,
         )
 
-    def generate_clip(self, prompt: str, duration: int, output_path: Path) -> Path:
-        """Genera un único clip WAV de hasta 30 segundos."""
-        self._load()
-        self._set_params(min(duration, settings.MUSICGEN_CLIP_DURATION))
+    # ─── generación de un clip ───────────────────────────────────────────────
+    def _save_wav(self, wav_tensor: torch.Tensor, output_path: Path) -> None:
+        """wav_tensor: [channels, samples] en float CPU."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        torchaudio.save(
+            str(output_path),
+            wav_tensor,
+            sample_rate=settings.MUSICGEN_NATIVE_SR,
+            encoding="PCM_S",
+            bits_per_sample=16,
+        )
 
-        logger.info(f"Generando clip {duration}s: {prompt[:80]}…")
+    def generate_clip(
+        self,
+        prompt: str,
+        duration: int,
+        output_path: Path,
+        cfg_coef: Optional[float] = None,
+    ) -> Path:
+        """Genera un clip único de hasta MUSICGEN_CLIP_DURATION segundos."""
+        self._load()
+        self._set_params(
+            min(duration, settings.MUSICGEN_CLIP_DURATION),
+            cfg_coef if cfg_coef is not None else settings.MUSICGEN_CFG_BODY,
+        )
+        logger.info(f"Generando clip {duration}s [cfg={cfg_coef}]: {prompt[:90]}…")
+
         with torch.cuda.amp.autocast(enabled=self._device == "cuda"):
             wav = self._model.generate([prompt], progress=True)
 
-        wav = wav[0].cpu().float()
-        torchaudio.save(str(output_path), wav, sample_rate=32000)
+        wav = wav[0].cpu().float()  # [channels, samples]
+        self._save_wav(wav, output_path)
         torch.cuda.empty_cache()
         return output_path
 
-    def generate_long(self, prompt: str, total_seconds: int, output_path: Path) -> Path:
+    def _generate_continuation(
+        self,
+        prompt: str,
+        context_wav: torch.Tensor,
+        context_sr: int,
+        new_duration: int,
+        output_path: Path,
+        cfg_coef: float,
+    ) -> Path:
         """
-        Genera audio de larga duración concatenando clips de 30s con crossfade.
-        Varía el prompt sutilmente en cada clip para evitar repetición.
+        Continúa una pista existente. Pasamos los últimos N segundos como
+        contexto para que MusicGen mantenga melodía, armonía y groove.
         """
-        clip_dur = settings.MUSICGEN_CLIP_DURATION
-        overlap = settings.MUSICGEN_OVERLAP
-        clips_needed = math.ceil(total_seconds / (clip_dur - overlap))
+        ctx_seconds = context_wav.shape[-1] / context_sr
+        total = int(ctx_seconds + new_duration)
+        self._set_params(total, cfg_coef)
 
-        logger.info(f"Generando {clips_needed} clips de {clip_dur}s → total {total_seconds}s")
+        # MusicGen espera batch dim: [B, C, T]
+        if context_wav.dim() == 2:
+            context_batched = context_wav.unsqueeze(0)
+        else:
+            context_batched = context_wav
+
+        if self._device == "cuda":
+            context_batched = context_batched.to("cuda")
+
+        logger.info(
+            f"Continuando {new_duration}s sobre {ctx_seconds:.1f}s de contexto "
+            f"[cfg={cfg_coef}]: {prompt[:80]}…"
+        )
+        with torch.cuda.amp.autocast(enabled=self._device == "cuda"):
+            wav = self._model.generate_continuation(
+                prompt=context_batched,
+                prompt_sample_rate=context_sr,
+                descriptions=[prompt],
+                progress=True,
+            )
+
+        wav = wav[0].cpu().float()
+        # recortar el contexto inicial — solo nos quedamos con lo nuevo
+        ctx_samples = context_wav.shape[-1]
+        new_only = wav[..., ctx_samples:]
+        self._save_wav(new_only, output_path)
+        torch.cuda.empty_cache()
+        return output_path
+
+    # ─── long-form coherente ─────────────────────────────────────────────────
+    async def generate_long(
+        self,
+        base_prompt_fn,
+        total_seconds: int,
+        output_path: Path,
+        style: MusicStyle,
+        bpm: int,
+    ) -> Path:
+        """
+        Genera audio de larga duración manteniendo coherencia melódica/armónica
+        mediante generate_continuation().
+
+        base_prompt_fn(section: str) -> str  permite variar la sección sin
+        cambiar el resto del prompt.
+        """
+        self._load()
+        clip_dur = settings.MUSICGEN_CLIP_DURATION
+        ctx_secs = settings.MUSICGEN_CONTINUATION_SECONDS
+        clips_needed = max(1, math.ceil(total_seconds / clip_dur))
+
+        logger.info(
+            f"Long-form: {clips_needed} clips × {clip_dur}s "
+            f"({'stereo' if self._is_stereo else 'mono'}) → ~{total_seconds}s"
+        )
+
         clip_paths: list[Path] = []
+        prev_wav: Optional[torch.Tensor] = None
+        prev_sr: int = settings.MUSICGEN_NATIVE_SR
 
         for i in range(clips_needed):
-            varied = self._vary_prompt(prompt, i, clips_needed)
+            section = section_for_position(i, clips_needed)
+            prompt = base_prompt_fn(section)
             clip_path = output_path.parent / f"_chunk_{output_path.stem}_{i:03d}.wav"
-            self.generate_clip(varied, clip_dur, clip_path)
+
+            cfg = (
+                settings.MUSICGEN_CFG_INTRO if section == "intro"
+                else settings.MUSICGEN_CFG_BODY
+            )
+
+            if i == 0 or prev_wav is None:
+                self.generate_clip(prompt, clip_dur, clip_path, cfg_coef=cfg)
+            else:
+                ctx_samples = int(ctx_secs * prev_sr)
+                context = prev_wav[..., -ctx_samples:]
+                self._generate_continuation(
+                    prompt=prompt,
+                    context_wav=context,
+                    context_sr=prev_sr,
+                    new_duration=clip_dur,
+                    output_path=clip_path,
+                    cfg_coef=cfg,
+                )
+
+            prev_wav, prev_sr = torchaudio.load(str(clip_path))
             clip_paths.append(clip_path)
-            logger.info(f"  [{i+1}/{clips_needed}] OK")
+            logger.info(f"  [{i+1}/{clips_needed}] OK ({section})  VRAM={self.vram_usage()}")
 
-        import asyncio
         from music_generator.audio_processor import AudioProcessor
-
-        async def _concat():
-            return await AudioProcessor.concatenate_clips(clip_paths, output_path)
-
-        result = asyncio.run(_concat())
+        result = await AudioProcessor.concatenate_clips_wav(clip_paths, output_path)
 
         for p in clip_paths:
             p.unlink(missing_ok=True)
-
         return result
-
-    def _vary_prompt(self, base: str, idx: int, total: int) -> str:
-        pos = idx / max(total - 1, 1)
-        if pos < 0.1:
-            return base + ", intro, atmospheric build-up, slow start"
-        elif pos < 0.3:
-            return base + ", building energy, increasing intensity"
-        elif pos < 0.7:
-            return base + ", peak energy, full groove, main section"
-        elif pos < 0.9:
-            return base + ", sustained energy, hypnotic loop"
-        else:
-            return base + ", outro, fading intensity, winding down"
 
     def vram_usage(self) -> str:
         if not torch.cuda.is_available():
@@ -116,6 +231,27 @@ class MusicGenerator:
         total = torch.cuda.get_device_properties(0).total_memory / 1e9
         return f"{used:.1f}/{total:.1f}GB"
 
+    def unload(self) -> None:
+        """Libera VRAM. Crítico antes de cargar SDXL en GPUs de 6GB."""
+        if self._model is None:
+            return
+        import gc
+        try:
+            self._model.lm.to("cpu")
+            self._model.compression_model.to("cpu")
+        except Exception:
+            pass
+        del self._model
+        self._model = None
+        self._model_name = None
+        self._is_stereo = False
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        logger.info("MusicGenerator descargado de VRAM")
+
+    # ─── orquestación de alto nivel ──────────────────────────────────────────
     async def run(
         self,
         job_id: int,
@@ -124,16 +260,34 @@ class MusicGenerator:
         prompt: str,
         bpm: int,
     ) -> int:
-        """Genera música, procesa audio y guarda MusicAsset. Devuelve asset_id."""
+        """Genera + procesa + persiste MusicAsset. Devuelve asset_id."""
         from music_generator.audio_processor import AudioProcessor
 
-        raw_path = settings.MUSIC_DIR / f"raw_{job_id}.wav"
         settings.MUSIC_DIR.mkdir(parents=True, exist_ok=True)
+        raw_path = settings.MUSIC_DIR / f"raw_{job_id}.wav"
 
         if duration_seconds <= settings.MUSICGEN_CLIP_DURATION:
             self.generate_clip(prompt, duration_seconds, raw_path)
         else:
-            self.generate_long(prompt, duration_seconds, raw_path)
+            # Fijar instrumentación + referencia UNA vez para toda la pista,
+            # sólo variará el descriptor de sección (energía).
+            track_elements, track_ref = sample_track_identity(style)
+
+            def prompt_for_section(section: str) -> str:
+                section_prompt, _ = build_music_prompt(
+                    style=style, duration_seconds=duration_seconds,
+                    bpm=bpm, section=section,
+                    elements=track_elements, reference=track_ref,
+                )
+                return section_prompt
+
+            await self.generate_long(
+                base_prompt_fn=prompt_for_section,
+                total_seconds=duration_seconds,
+                output_path=raw_path,
+                style=style,
+                bpm=bpm,
+            )
 
         processed_path = settings.MUSIC_DIR / f"music_{job_id}.mp3"
         await AudioProcessor.process(raw_path, processed_path, duration_seconds)
@@ -153,7 +307,11 @@ class MusicGenerator:
                 sample_rate=settings.AUDIO_SAMPLE_RATE,
                 loudness_lufs=settings.TARGET_LOUDNESS,
                 is_processed=True,
-                generation_metadata={"model": settings.MUSICGEN_MODEL, "device": self._device},
+                generation_metadata={
+                    "model": self._model_name or settings.MUSICGEN_MODEL,
+                    "stereo": self._is_stereo,
+                    "device": self._device,
+                },
             )
             db.add(asset)
             db.flush()
@@ -168,7 +326,7 @@ class MusicGenerator:
         style: MusicStyle,
         duration_seconds: int,
     ) -> int:
-        """Prueba hasta 3 variaciones de prompt antes de fallar."""
+        """Hasta 3 variaciones de prompt antes de fallar."""
         import asyncio
         variations = build_music_prompt_variations(style, duration_seconds, count=3)
         last_error = None
@@ -192,7 +350,7 @@ class MusicGenerator:
         raise RuntimeError(f"Todos los intentos de generación fallaron: {last_error}")
 
 
-# Singleton — una instancia por proceso worker
+# Singleton — una instancia por proceso
 _instance: Optional[MusicGenerator] = None
 
 

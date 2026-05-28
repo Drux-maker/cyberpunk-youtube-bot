@@ -30,11 +30,16 @@ class Settings(BaseSettings):
     REDIS_URL: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
 
     # ─── MusicGen local ───────────────────────────────────────────────────────
-    MUSICGEN_MODEL: str = "facebook/musicgen-medium"  # cabe en 6GB VRAM
-    MUSICGEN_CLIP_DURATION: int = 30       # segundos por clip
-    MUSICGEN_OVERLAP: int = 2              # segundos de crossfade entre clips
-    MUSICGEN_CFG_COEF: float = 3.5        # adherencia al prompt
+    MUSICGEN_MODEL: str = "facebook/musicgen-stereo-medium"      # estéreo nativo, ~4.2GB VRAM en fp16
+    MUSICGEN_FALLBACK_MODEL: str = "facebook/musicgen-medium"    # mono, fallback si OOM
+    MUSICGEN_CLIP_DURATION: int = 30                              # segundos por clip
+    MUSICGEN_CONTINUATION_SECONDS: float = 10.0                   # contexto pasado al modelo entre clips
+    MUSICGEN_CFG_INTRO: float = 3.0                               # CFG más libre al arrancar
+    MUSICGEN_CFG_BODY: float = 4.5                                # CFG más estricto en el cuerpo
     MUSICGEN_TEMPERATURE: float = 1.0
+    MUSICGEN_TOP_K: int = 250
+    MUSICGEN_TOP_P: float = 0.0
+    MUSICGEN_NATIVE_SR: int = 32000                               # MusicGen genera a 32 kHz
 
     # ─── Stable Diffusion local ───────────────────────────────────────────────
     SD_MODEL: str = "stabilityai/stable-diffusion-xl-base-1.0"
@@ -70,8 +75,11 @@ class Settings(BaseSettings):
     VIDEO_FPS: int = 30
     VIDEO_BITRATE: str = "8000k"
     AUDIO_BITRATE: str = "320k"
-    AUDIO_SAMPLE_RATE: int = 44100
-    TARGET_LOUDNESS: float = -14.0  # LUFS — estándar YouTube
+    AUDIO_AAC_BITRATE: str = "256k"                 # YouTube prefiere AAC
+    AUDIO_SAMPLE_RATE: int = 48000                  # 48 kHz: estándar profesional de vídeo
+    TARGET_LOUDNESS: float = -14.0                  # LUFS — estándar YouTube
+    TARGET_TRUE_PEAK: float = -1.0                  # dBTP — margen para evitar clipping en transcoders
+    EXPORT_AAC: bool = True                         # exportar también M4A/AAC además de MP3
 
     # ─── Music durations ──────────────────────────────────────────────────────
     MUSIC_DURATIONS: list = [600, 1800, 3600]  # 10min, 30min, 1h

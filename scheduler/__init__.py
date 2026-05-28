@@ -1,4 +1,4 @@
-from .tasks import app, build_pipeline
 from .pipeline import scheduler
+from .orchestrator import run_video_pipeline, run_video_pipeline_sync
 
-__all__ = ["app", "build_pipeline", "scheduler"]
+__all__ = ["scheduler", "run_video_pipeline", "run_video_pipeline_sync"]

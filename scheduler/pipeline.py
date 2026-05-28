@@ -133,12 +133,14 @@ class DailyScheduler:
         with get_db() as db:
             return db.query(VideoJob).filter(VideoJob.status.in_(active_statuses)).count()
 
-    def schedule_daily_batch(self) -> list[str]:
+    def run_daily_batch(self) -> list[dict]:
         """
-        Main entry point: generate today's video batch.
-        Returns list of Celery chain task IDs.
+        Main entry point: generate today's batch sequentially.
+
+        Returns the list of pipeline result dicts (one per video).
+        Each entry contains job_id, paths and (if upload succeeded) youtube_url.
         """
-        from scheduler.tasks import build_pipeline
+        from scheduler.orchestrator import run_video_pipeline_sync
 
         self.update_weights_from_analytics()
 
@@ -151,7 +153,7 @@ class DailyScheduler:
         n_to_create = n_videos - active
         publish_times = self.get_publish_times_today(n_to_create)
 
-        task_ids = []
+        results: list[dict] = []
         used_styles = set()
 
         for i in range(n_to_create):
@@ -167,13 +169,25 @@ class DailyScheduler:
             used_styles.add(style)
             duration = self.pick_duration()
             publish_at = publish_times[i] if i < len(publish_times) else None
-            publish_at_iso = publish_at.isoformat() if publish_at else None
 
-            logger.info(f"Scheduling: {style.value} / {duration}s / publish at {publish_at_iso}")
-            task_id = build_pipeline(style.value, duration, publish_at_iso)
-            task_ids.append(task_id)
+            logger.info(
+                f"[{i+1}/{n_to_create}] {style.value} / {duration}s"
+                f"{f' / publish {publish_at.isoformat()}' if publish_at else ''}"
+            )
+            try:
+                result = run_video_pipeline_sync(
+                    style=style,
+                    duration_seconds=duration,
+                    publish_at=publish_at,
+                    upload=True,
+                )
+                results.append(result)
+            except Exception as exc:
+                logger.error(f"Video {i+1} failed: {exc}")
+                # continue with the rest of the batch instead of aborting
+                continue
 
-        return task_ids
+        return results
 
 
 scheduler = DailyScheduler()

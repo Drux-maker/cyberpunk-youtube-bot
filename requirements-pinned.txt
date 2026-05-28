@@ -1,0 +1,52 @@
+# Versiones exactas probadas juntas para RTX 3060 / CUDA 12.1 / Python 3.12
+# Instalar en orden:
+#   pip install torch==2.4.0+cu121 torchaudio==2.4.0+cu121 torchvision==0.19.0+cu121 --index-url https://download.pytorch.org/whl/cu121
+#   pip install xformers==0.0.27.post2 --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements-pinned.txt
+
+numpy==1.26.4
+transformers==4.44.2
+tokenizers==0.19.1
+diffusers==0.30.3
+accelerate==0.33.0
+safetensors==0.4.4
+huggingface_hub==0.24.7
+
+# audiocraft deps (sin spacy)
+einops==0.8.0
+encodec==0.1.1
+flashy==0.0.2
+julius==0.2.7
+num2words==0.5.14
+omegaconf==2.3.0
+sentencepiece==0.2.0
+librosa==0.10.2
+av==13.1.0
+torchmetrics==1.4.2
+
+# Audio
+pyloudnorm==0.1.1
+soundfile==0.12.1
+
+# Imagen
+Pillow==10.4.0
+
+# YouTube API
+google-api-python-client==2.149.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1
+google-auth==2.35.0
+
+# OpenAI (SEO)
+openai==1.51.2
+
+# Web / DB / Queue
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings==2.5.2
+sqlalchemy==2.0.35
+alembic==1.13.3
+celery==5.4.0
+redis==5.1.1
+python-dotenv==1.0.1

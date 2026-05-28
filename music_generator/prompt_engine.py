@@ -14,66 +14,122 @@ from database.models import MusicStyle, PromptLibrary
 from database.db import get_db
 
 
+# Vocabulario "track comercial actual" — términos que MusicGen reconoce porque
+# entrenó con metadata real de Beatport/Spotify/Discogs. Se aplica a todos los
+# estilos para evitar el sonido "AI demo" y empujar hacia algo que podría sonar
+# en un festival o en una playlist de Spotify.
+PRO_PRODUCTION_KEYWORDS = (
+    "Beatport top 10 production, festival-ready master, club banger, "
+    "punchy compressed kick, sidechained sub bass, wide stereo image, "
+    "crisp transients, polished commercial mix, peak time energy"
+)
+
+# Negative prompt para evitar lo que hace que suene a "AI generation demo".
+NEGATIVE_PROMPT = (
+    "muddy mix, amateur production, lo-fi, demo recording, "
+    "static loop, boring, repetitive, weak bass, harsh treble, "
+    "out of tune, distorted clipping, background music, ambient drone"
+)
+
+
+# Templates re-orientados: foco en productores y labels ACTUALES (2020-2024)
+# que el modelo asocia con sonido comercial moderno, no underground 90s.
 STYLE_TEMPLATES = {
     MusicStyle.DARK_TECHNO: {
-        "base": "dark techno instrumental, pounding four-on-the-floor kick, deep rolling sub bass, industrial atmosphere, dystopian warehouse",
-        "elements": ["acid 303 stabs", "metallic percussion", "filtered noise sweeps", "long reverb tails", "modular synth textures"],
-        "references": ["Surgeon", "Phase Fatale", "Rebekah"],
-        "bpm_range": (130, 140),
-        "tempo_phrase": "driving {bpm} BPM four-on-the-floor groove",
+        "base": "modern peak-time dark techno banger, driving four-on-the-floor kick, rolling reese bass, hypnotic warehouse energy, Drumcode label production quality",
+        "elements": [
+            "rolling reese bassline", "Roland 909 drum kit", "tense modular arpeggio",
+            "sidechain-pumping pad", "tape-saturated hi-hats", "industrial reverb stab",
+            "filter-swept lead", "snare roll build-up",
+        ],
+        "references": ["Charlotte de Witte", "Adam Beyer", "Amelie Lens", "I Hate Models"],
+        "bpm_range": (134, 140),
+        "tempo_phrase": "driving {bpm} BPM warehouse techno groove",
     },
     MusicStyle.CYBERPUNK: {
-        "base": "cyberpunk electronic instrumental, neon-lit nocturnal atmosphere, cinematic synthwave-techno hybrid, rain-soaked urban tension",
-        "elements": ["analog lead synth", "heavy synth bassline", "dystopian pad layers", "arpeggiated sequencer", "vocoded textures"],
-        "references": ["Perturbator", "Carpenter Brut", "Dan Terminus"],
-        "bpm_range": (118, 132),
-        "tempo_phrase": "pulsing {bpm} BPM mid-tempo groove",
+        "base": "modern cyberpunk electronic banger, cinematic dark synthwave-techno hybrid, neon-lit dystopian energy, festival-ready production",
+        "elements": [
+            "fat analog lead synth", "distorted bitcrushed bass", "vocoded robotic chops",
+            "side-chained pumping pad", "trap-style hi-hats", "cinematic riser",
+            "epic supersaw drop", "808 sub kick",
+        ],
+        "references": ["Perturbator", "GosT", "Dan Terminus", "Kavinsky"],
+        "bpm_range": (124, 132),
+        "tempo_phrase": "pulsing {bpm} BPM dark club groove",
     },
     MusicStyle.NEON_AMBIENT: {
-        "base": "ambient electronic instrumental, deep immersive neon city soundscape, slow evolving textures, introspective late-night mood",
-        "elements": ["long reverb pads", "sub bass pulses", "delicate melodic sequence", "granular textures", "field-recorded distant city"],
-        "references": ["Burial", "The Haxan Cloak", "Tim Hecker"],
-        "bpm_range": (75, 95),
-        "tempo_phrase": "slow {bpm} BPM downtempo pulse",
+        "base": "deep cinematic neon ambient instrumental, lush evolving cinematic textures, modern soundtrack production, polished mix",
+        "elements": [
+            "wide reverb pad layers", "deep sub bass pulse", "delicate piano melody",
+            "warm analog texture", "field recording atmosphere", "subtle granular shimmer",
+            "tape saturation", "cinematic strings",
+        ],
+        "references": ["Jon Hopkins", "Burial", "Tycho", "Boards of Canada"],
+        "bpm_range": (80, 95),
+        "tempo_phrase": "slow {bpm} BPM cinematic downtempo pulse",
     },
     MusicStyle.INDUSTRIAL: {
-        "base": "industrial techno instrumental, harsh distorted kick, mechanical apocalyptic atmosphere, raw warehouse aggression",
-        "elements": ["distorted kick drum", "industrial metal hits", "white noise bursts", "power electronics", "doom drone bass"],
-        "references": ["Vatican Shadow", "Paula Temple", "Regis"],
-        "bpm_range": (140, 155),
-        "tempo_phrase": "relentless {bpm} BPM pounding beat",
+        "base": "hard industrial techno banger, distorted pounding kick, mechanical aggression, peak-time warehouse energy, KNTXT label production",
+        "elements": [
+            "distorted overdriven kick", "industrial metal percussion",
+            "reese bass growl", "white noise riser",
+            "sidechain-pumped acid lead", "compressed reverb stab",
+            "snare drum roll", "harsh filter sweep",
+        ],
+        "references": ["I Hate Models", "VTSS", "SPFDJ", "Paula Temple"],
+        "bpm_range": (140, 150),
+        "tempo_phrase": "relentless {bpm} BPM industrial pounding",
     },
     MusicStyle.SYNTHWAVE: {
-        "base": "synthwave instrumental, retro-futuristic 1980s analog production, dreamy neon nostalgia, cinematic Miami night drive",
-        "elements": ["warm analog lead synth", "gated reverb snare", "arpeggio bass sequence", "DX7 electric piano", "chorus-drenched bass"],
-        "references": ["Kavinsky", "Mitch Murder", "The Midnight"],
-        "bpm_range": (98, 118),
-        "tempo_phrase": "smooth {bpm} BPM mid-tempo drive",
+        "base": "modern synthwave banger, 80s-inspired retro-futuristic production, cinematic neon night drive, polished commercial mix",
+        "elements": [
+            "warm analog lead synth", "gated reverb snare drum",
+            "arpeggiated bass sequence", "DX7 electric piano stab",
+            "chorused bass guitar", "vintage tape saturation",
+            "sidechained pad", "wide stereo synth lead",
+        ],
+        "references": ["The Midnight", "FM-84", "Mitch Murder", "Kavinsky"],
+        "bpm_range": (100, 118),
+        "tempo_phrase": "smooth {bpm} BPM driving mid-tempo",
     },
     MusicStyle.ACID_TECHNO: {
-        "base": "acid techno instrumental, Roland TB-303 squelching bassline, hypnotic warehouse groove, raw analog underground",
-        "elements": ["TB-303 acid bassline", "Roland 909 drum machine", "squelchy resonant filter sweeps", "hi-hat 16th-note pattern", "minimal arrangement"],
-        "references": ["Josh Wink", "Hardfloor", "Dave Clarke"],
-        "bpm_range": (133, 145),
-        "tempo_phrase": "hypnotic {bpm} BPM four-on-the-floor",
+        "base": "modern acid techno banger, Roland TB-303 squelching bassline, hypnotic peak-time energy, Octopus Recordings production quality",
+        "elements": [
+            "TB-303 acid bassline", "Roland 909 drums",
+            "resonant filter sweep", "punchy clap layer",
+            "minimal hi-hat groove", "acid lead arpeggio",
+            "tape-warmed kick", "warehouse reverb",
+        ],
+        "references": ["Sina XX", "Boris Brejcha", "Reinier Zonneveld", "Sven Väth"],
+        "bpm_range": (135, 145),
+        "tempo_phrase": "hypnotic {bpm} BPM acid peak-time",
     },
     MusicStyle.HARDTEK: {
-        "base": "hardtek free-party instrumental, distorted hard kick, psychedelic tribal underground rave energy",
-        "elements": ["distorted 303 bass", "hardcore kick drum", "ethnic tribal percussion", "psychedelic vocal chops", "rave stabs"],
-        "references": ["Radium", "Dr. Macabre", "Acid Mike"],
+        "base": "modern hardtek banger, distorted hard kick, peak-time festival rave energy, polished hard dance production",
+        "elements": [
+            "distorted overdriven kick drum", "screeching 303 acid bass",
+            "tribal psychedelic percussion", "chopped vocal stab",
+            "epic rave stab", "snare roll build-up",
+            "white noise riser", "hardcore lead synth",
+        ],
+        "references": ["Sefa", "Dr. Peacock", "Sickmode", "Hard Driver"],
         "bpm_range": (170, 185),
-        "tempo_phrase": "fast {bpm} BPM hardcore tempo",
+        "tempo_phrase": "explosive {bpm} BPM peak-time hardcore",
     },
 }
 
-# Solo cambian descriptores de energía/dinámica, NO de instrumentación,
-# para no romper coherencia armónica con continuation mode.
+# Estructura de pista DJ comercial. Los descriptores son los que un productor
+# usaría en Beatport/Discogs y MusicGen reconoce. Solo cambian estos descriptores
+# entre clips — NO la instrumentación — para mantener coherencia con
+# continuation mode.
 ENERGY_SECTIONS = {
-    "intro":    "atmospheric intro, restrained energy, sparse arrangement",
-    "buildup":  "rising tension, layers gradually adding",
-    "peak":     "full energy peak section, all elements active",
-    "sustain":  "sustained groove, hypnotic locked-in flow",
-    "outro":    "winding down, elements dropping out, fade-friendly tail",
+    "intro":      "DJ intro section, stripped kick and bass only, beatport-style minimal arrangement",
+    "build1":     "first build-up, rising tension, snare drum roll, filter sweep opening up",
+    "drop1":      "first drop, full energy banger, all elements active, peak time club moment",
+    "breakdown":  "breakdown section, kick drops out, atmospheric pad and lead melody, building tension",
+    "build2":     "second build-up, riser sweeping, snare roll accelerating, anticipation peak",
+    "drop2":      "second drop, biggest moment of the track, maximum energy festival anthem",
+    "outro":      "DJ outro section, elements dropping out one by one, minimal kick-and-bass tail",
 }
 
 
@@ -118,12 +174,18 @@ def build_music_prompt(
         tempo,
         ", ".join(elements),
         f"in the style of {ref}",
+        PRO_PRODUCTION_KEYWORDS,
         "instrumental, no vocals",
     ]
     if section and section in ENERGY_SECTIONS:
         parts.insert(2, ENERGY_SECTIONS[section])
 
     return ", ".join(parts), bpm
+
+
+def get_negative_prompt() -> str:
+    """Negative prompt común para todos los estilos — usado vía dual-CFG."""
+    return NEGATIVE_PROMPT
 
 
 def build_music_prompt_variations(
@@ -157,18 +219,36 @@ def sample_track_identity(style: MusicStyle) -> tuple[list[str], str]:
 
 
 def section_for_position(idx: int, total: int) -> str:
-    """Return section name based on relative position in long-form generation."""
+    """
+    Devuelve la sección DJ-style según la posición relativa en una pista
+    long-form. Patrón clásico de pista de DJ comercial:
+
+        intro → build1 → drop1 → breakdown → build2 → drop2 → outro
+
+    Para tracks cortos (1-2 clips) hace fallback a 'drop1' (sección de
+    máxima energía) porque es lo que más vende como muestra.
+    """
     if total <= 1:
-        return "peak"
+        return "drop1"
+    if total == 2:
+        return "intro" if idx == 0 else "drop1"
+    if total == 3:
+        return ["intro", "drop1", "outro"][idx]
+
+    # >=4 clips: estructura DJ completa
     pos = idx / (total - 1)
-    if pos < 0.05:
+    if pos < 0.10:
         return "intro"
-    if pos < 0.2:
-        return "buildup"
-    if pos < 0.85:
-        return "peak" if idx % 3 != 0 else "sustain"
-    if pos < 0.95:
-        return "sustain"
+    if pos < 0.25:
+        return "build1"
+    if pos < 0.45:
+        return "drop1"
+    if pos < 0.60:
+        return "breakdown"
+    if pos < 0.75:
+        return "build2"
+    if pos < 0.92:
+        return "drop2"
     return "outro"
 
 

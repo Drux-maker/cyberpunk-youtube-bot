@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     MUSICGEN_TOP_K: int = 250
     MUSICGEN_TOP_P: float = 0.0
     MUSICGEN_NATIVE_SR: int = 32000                               # MusicGen genera a 32 kHz
+    # Multi-Band Diffusion: calidad pro pero ~10x más lento que EnCodec.
+    # Default OFF; usar solo para clips premium / showcase (1 video especial).
+    MUSICGEN_USE_MBD: bool = False
+    MUSICGEN_USE_NEGATIVE_PROMPT: bool = True                     # CFG negative prompt para evitar "lo-fi"
 
     # ─── Stable Diffusion local — JuggernautXL Lightning ─────────────────────
     # Refinado SDXL de RunDiffusion: foto-realismo superior + scheduler Lightning

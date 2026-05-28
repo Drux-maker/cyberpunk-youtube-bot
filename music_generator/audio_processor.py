@@ -54,38 +54,56 @@ def _master_filter_chain(
     measured: Optional[dict] = None,
 ) -> str:
     """
-    Build the full mastering filter chain.
+    Cadena de mastering profesional construida íntegramente con filtros nativos
+    de FFmpeg (sin dependencias externas). El orden y los parámetros están
+    pensados para que el resultado SUENE A PRODUCCIÓN COMERCIAL, no a "AI
+    music crudo".
 
-    `measured` viene de la primera pasada de loudnorm — si no, se aplica en
-    modo single-pass (menos preciso pero válido).
+    Orden (todo dentro de un único filter graph para evitar re-codings):
+
+      1. Upsample SoX VHQ a 48 kHz
+      2. Limpieza espectral: HPF 30 Hz, dip 250 Hz, lift agudo @ 10 kHz
+      3. Forzar estéreo + widening suave (para no morir si entró mono)
+      4. SATURACIÓN ARMÓNICA TIPO CINTA (asoftclip tanh) — clave para warmth
+      5. COMPRESIÓN MULTIBANDA (3 bandas: <200 Hz / 200-2 kHz / >2 kHz)
+         vía acrossover + acompressor por canal + amerge final.
+         Cada banda con su attack/release adaptado al rango.
+      6. DE-ESSER suave (bell -2 dB @ 7 kHz, Q 2)
+      7. EXCITER (presence boost 12 kHz + air shelf 15 kHz)
+      8. Fades
+      9. Loudnorm de 2 pasadas a -14 LUFS / -1 dBTP
+     10. MAXIMIZER: dynaudnorm para nivelar el master + alimiter brickwall
+         como red de seguridad final.
+
+    `measured` viene de la primera pasada de loudnorm (offline). Si no se
+    pasa, loudnorm trabaja en single-pass (menos preciso pero válido).
     """
-    parts = []
+    # Filter_complex que enlaza [0:a] -> ... -> [aout].
+    # PRE: pasos lineales antes de la compresión multibanda
+    pre = (
+        f"aresample=resampler=soxr:precision=28:osf=s32:out_sample_rate={settings.AUDIO_SAMPLE_RATE},"
+        "highpass=f=30:poles=2,"
+        "equalizer=f=250:t=q:w=1.2:g=-1.5,"
+        "treble=g=1.5:f=10000,"
+        "aformat=channel_layouts=stereo,"
+        "extrastereo=m=1.12:c=false,"
+        # saturación tipo cinta: roza los picos, deja respirar el cuerpo
+        "asoftclip=type=tanh:threshold=0.92:output=0.95"
+    )
 
-    # 1. Resample alta calidad a 48 kHz
-    parts.append(f"aresample=resampler=soxr:precision=28:osf=s32:out_sample_rate={settings.AUDIO_SAMPLE_RATE}")
+    # MULTIBANDA 3-band: split → comp por banda → amix
+    multiband = (
+        "asplit=3[low_in][mid_in][high_in];"
+        "[low_in]lowpass=f=200:poles=2,"
+        "acompressor=threshold=-20dB:ratio=2.2:attack=40:release=300:makeup=2:knee=6[low];"
+        "[mid_in]highpass=f=200:poles=2,lowpass=f=2000:poles=2,"
+        "acompressor=threshold=-18dB:ratio=2:attack=15:release=150:makeup=1.5:knee=4[mid];"
+        "[high_in]highpass=f=2000:poles=2,"
+        "acompressor=threshold=-16dB:ratio=1.6:attack=3:release=60:makeup=1:knee=3[high];"
+        "[low][mid][high]amix=inputs=3:normalize=1"
+    )
 
-    # 2. EQ correctivo + carácter
-    #    - high-pass suave para limpiar rumble sub-30Hz
-    #    - cut suave en 250 Hz para reducir barro
-    #    - shelf alto para "aire"
-    parts.append("highpass=f=30:poles=2")
-    parts.append("equalizer=f=250:t=q:w=1.2:g=-1.5")
-    parts.append("treble=g=1.5:f=10000")
-
-    # 3. Compresión suave de carácter (acompressor — single-band sutil)
-    #    threshold -18, ratio 2:1, attack 20ms, release 250ms
-    parts.append("acompressor=threshold=-18dB:ratio=2:attack=20:release=250:makeup=1.5:knee=4")
-
-    # 4. Forzar layout estéreo (upmix mono → estéreo si hace falta) y aplicar
-    #    un widener muy suave. Sin el aformat previo, extrastereo falla en mono.
-    parts.append("aformat=channel_layouts=stereo")
-    parts.append("extrastereo=m=1.15:c=false")
-
-    # 5. Fades
-    parts.append(f"afade=t=in:st=0:d={fade_in:.3f}")
-    parts.append(f"afade=t=out:st={fade_out_start:.3f}:d={fade_out_dur:.3f}")
-
-    # 6. Loudnorm — segunda pasada con valores medidos
+    # POST: de-esser + exciter + fades + loudnorm + maximizer
     if measured:
         loudnorm = (
             f"loudnorm=I={target_lufs}:TP={target_tp}:LRA=9:"
@@ -95,13 +113,20 @@ def _master_filter_chain(
         )
     else:
         loudnorm = f"loudnorm=I={target_lufs}:TP={target_tp}:LRA=9:print_format=summary"
-    parts.append(loudnorm)
 
-    # 7. True-peak limiter de seguridad (alimit) — captura cualquier transitorio
-    #    por encima del TP target.
-    parts.append(f"alimiter=limit={10 ** (target_tp / 20):.4f}:attack=5:release=50:level=disabled")
+    post = (
+        "equalizer=f=7000:t=q:w=2:g=-2,"                            # de-esser
+        "equalizer=f=12000:t=q:w=1.5:g=1.2,"                        # presence
+        "treble=g=2:f=15000,"                                       # air
+        f"afade=t=in:st=0:d={fade_in:.3f},"
+        f"afade=t=out:st={fade_out_start:.3f}:d={fade_out_dur:.3f},"
+        f"{loudnorm},"
+        "dynaudnorm=framelen=500:gausssize=15:peak=0.95:maxgain=4,"
+        f"alimiter=limit={10 ** (target_tp / 20):.4f}:attack=5:release=50:level=disabled"
+    )
 
-    return ",".join(parts)
+    # Construir filter_complex completo con labels
+    return f"[0:a]{pre},{multiband},{post}[aout]"
 
 
 # ─── main API ────────────────────────────────────────────────────────────────
@@ -209,10 +234,15 @@ class AudioProcessor:
         codec: str,
         bitrate: str,
     ) -> None:
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(input_path),
-            "-af", filter_chain,
+        # El master usa filter_complex (split/merge multibanda) si la cadena
+        # contiene labels [name]; si no, usa -af lineal.
+        uses_complex = "[" in filter_chain and "]" in filter_chain
+        cmd = ["ffmpeg", "-y", "-i", str(input_path)]
+        if uses_complex:
+            cmd += ["-filter_complex", filter_chain, "-map", "[aout]"]
+        else:
+            cmd += ["-af", filter_chain]
+        cmd += [
             "-c:a", codec,
             "-b:a", bitrate,
             "-ar", str(settings.AUDIO_SAMPLE_RATE),

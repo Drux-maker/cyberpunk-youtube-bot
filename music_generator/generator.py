@@ -36,10 +36,12 @@ class MusicGenerator:
 
     def __init__(self):
         self._model = None
+        self._mbd = None                             # Multi-Band Diffusion decoder
+        self._use_mbd: bool = settings.MUSICGEN_USE_MBD
         self._model_name: Optional[str] = None
         self._is_stereo: bool = False
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"MusicGenerator — device: {self._device}")
+        logger.info(f"MusicGenerator — device: {self._device}  MBD={self._use_mbd}")
 
     # ─── carga del modelo ────────────────────────────────────────────────────
     def _load_model(self, model_name: str) -> None:
@@ -52,6 +54,33 @@ class MusicGenerator:
         self._model_name = model_name
         self._is_stereo = "stereo" in model_name.lower()
         logger.info(f"Modelo listo — {'stereo' if self._is_stereo else 'mono'}")
+
+    def _load_mbd(self) -> bool:
+        """
+        Carga Multi-Band Diffusion bajo demanda. Devuelve True si se cargó OK,
+        False si OOM (en cuyo caso seguimos con EnCodec estándar).
+        """
+        if self._mbd is not None:
+            return True
+        if not self._use_mbd:
+            return False
+        try:
+            from audiocraft.models import MultiBandDiffusion
+            logger.info("Cargando Multi-Band Diffusion (decoder de alta calidad)…")
+            self._mbd = MultiBandDiffusion.get_mbd_musicgen(device=self._device)
+            logger.info(f"MBD listo  VRAM={self.vram_usage()}")
+            return True
+        except torch.cuda.OutOfMemoryError:
+            logger.warning("OOM cargando MBD — continuamos con decoder EnCodec estándar")
+            self._mbd = None
+            self._use_mbd = False
+            torch.cuda.empty_cache()
+            return False
+        except Exception as exc:
+            logger.warning(f"MBD no disponible ({exc}) — usando EnCodec estándar")
+            self._mbd = None
+            self._use_mbd = False
+            return False
 
     def _load(self) -> None:
         if self._model is not None:
@@ -90,6 +119,46 @@ class MusicGenerator:
             bits_per_sample=16,
         )
 
+    def _decode_with_mbd(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Decodifica tokens EnCodec con Multi-Band Diffusion en lugar del decoder
+        original. Devuelve wav float CPU [channels, samples] a 32 kHz.
+        Si MBD no está disponible, devuelve None y el caller usa el wav EnCodec.
+
+        Stereo handling: MBD está entrenado en MONO (4 codebooks). MusicGen
+        Stereo Medium emite 8 codebooks (4 por canal). Si detectamos shape
+        [B, 8, T] dividimos en [B, 4, T] izquierdo + [B, 4, T] derecho,
+        decodificamos cada uno por separado y los apilamos como estéreo.
+        """
+        if self._mbd is None and not self._load_mbd():
+            return None
+        try:
+            with torch.no_grad():
+                n_codebooks = tokens.shape[1]
+                if n_codebooks == 4:
+                    # mono nativo
+                    wav_mbd = self._mbd.tokens_to_wav(tokens)
+                    return wav_mbd[0].cpu().float()
+                if n_codebooks == 8:
+                    # estéreo: 4 codebooks por canal, decodificar por separado
+                    left  = self._mbd.tokens_to_wav(tokens[:, :4, :])   # [B, 1, T]
+                    right = self._mbd.tokens_to_wav(tokens[:, 4:, :])
+                    # Stack canales: [1, 2, samples]
+                    stereo = torch.cat([left, right], dim=1)
+                    return stereo[0].cpu().float()
+                logger.warning(
+                    f"MBD: número de codebooks inesperado ({n_codebooks}); "
+                    "fallback a EnCodec"
+                )
+                return None
+        except torch.cuda.OutOfMemoryError:
+            logger.warning("OOM en MBD decode — fallback a EnCodec para este clip")
+            torch.cuda.empty_cache()
+            return None
+        except Exception as exc:
+            logger.warning(f"MBD decode falló ({exc}) — fallback a EnCodec")
+            return None
+
     def generate_clip(
         self,
         prompt: str,
@@ -106,10 +175,13 @@ class MusicGenerator:
         logger.info(f"Generando clip {duration}s [cfg={cfg_coef}]: {prompt[:90]}…")
 
         with torch.cuda.amp.autocast(enabled=self._device == "cuda"):
-            wav = self._model.generate([prompt], progress=True)
+            wav, tokens = self._model.generate([prompt], progress=True, return_tokens=True)
 
-        wav = wav[0].cpu().float()  # [channels, samples]
-        self._save_wav(wav, output_path)
+        # Intentar decodificar con MBD para máxima calidad de audio
+        wav_mbd = self._decode_with_mbd(tokens)
+        wav_final = wav_mbd if wav_mbd is not None else wav[0].cpu().float()
+
+        self._save_wav(wav_final, output_path)
         torch.cuda.empty_cache()
         return output_path
 
@@ -125,6 +197,12 @@ class MusicGenerator:
         """
         Continúa una pista existente. Pasamos los últimos N segundos como
         contexto para que MusicGen mantenga melodía, armonía y groove.
+
+        Nota importante: el contexto que se pasa al modelo debe ser audio
+        decodificado por el codec ORIGINAL (EnCodec), no por MBD. El modelo
+        fue entrenado con representaciones EnCodec; mezclarlas confunde la
+        continuación. El wav final SÍ se decodifica con MBD para máxima
+        calidad de output.
         """
         ctx_seconds = context_wav.shape[-1] / context_sr
         total = int(ctx_seconds + new_duration)
@@ -144,17 +222,24 @@ class MusicGenerator:
             f"[cfg={cfg_coef}]: {prompt[:80]}…"
         )
         with torch.cuda.amp.autocast(enabled=self._device == "cuda"):
-            wav = self._model.generate_continuation(
+            wav, tokens = self._model.generate_continuation(
                 prompt=context_batched,
                 prompt_sample_rate=context_sr,
                 descriptions=[prompt],
                 progress=True,
+                return_tokens=True,
             )
 
-        wav = wav[0].cpu().float()
+        # Decodificar con MBD para máxima calidad del clip final
+        wav_mbd = self._decode_with_mbd(tokens)
+        if wav_mbd is not None:
+            wav_full = wav_mbd
+        else:
+            wav_full = wav[0].cpu().float()
+
         # recortar el contexto inicial — solo nos quedamos con lo nuevo
         ctx_samples = context_wav.shape[-1]
-        new_only = wav[..., ctx_samples:]
+        new_only = wav_full[..., ctx_samples:]
         self._save_wav(new_only, output_path)
         torch.cuda.empty_cache()
         return output_path
@@ -232,19 +317,38 @@ class MusicGenerator:
         return f"{used:.1f}/{total:.1f}GB"
 
     def unload(self) -> None:
-        """Libera VRAM. Crítico antes de cargar SDXL en GPUs de 6GB."""
-        if self._model is None:
+        """Libera VRAM. Crítico antes de cargar Juggernaut en GPUs de 6GB."""
+        if self._model is None and self._mbd is None:
             return
         import gc
-        try:
-            self._model.lm.to("cpu")
-            self._model.compression_model.to("cpu")
-        except Exception:
-            pass
-        del self._model
-        self._model = None
-        self._model_name = None
-        self._is_stereo = False
+        if self._mbd is not None:
+            try:
+                # MBD no tiene un único .to() global; movemos los componentes
+                for attr in ("models", "DPMs", "codec_model"):
+                    obj = getattr(self._mbd, attr, None)
+                    if obj is not None:
+                        try:
+                            if isinstance(obj, list):
+                                for sub in obj:
+                                    sub.to("cpu")
+                            else:
+                                obj.to("cpu")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            del self._mbd
+            self._mbd = None
+        if self._model is not None:
+            try:
+                self._model.lm.to("cpu")
+                self._model.compression_model.to("cpu")
+            except Exception:
+                pass
+            del self._model
+            self._model = None
+            self._model_name = None
+            self._is_stereo = False
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

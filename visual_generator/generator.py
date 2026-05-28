@@ -1,8 +1,13 @@
 """
-Generación de imágenes con Stable Diffusion local (HuggingFace Diffusers).
-Modelo principal: SDXL (stabilityai/stable-diffusion-xl-base-1.0)
-Fallback:         SD 1.5 (runwayml/stable-diffusion-v1-5)
-Optimizado para RTX 3060 6GB VRAM: fp16, xformers, attention slicing, vae tiling.
+Generación de imágenes con JuggernautXL Lightning (HuggingFace Diffusers).
+
+Modelo: RunDiffusion/Juggernaut-XL-Lightning
+  - Refinado SDXL con foto-realismo superior al base.
+  - Scheduler Lightning: 4-8 pasos (~5-10s/imagen en RTX 3060), CFG 1.5-3.0.
+  - Cabe en 6 GB VRAM en fp16 con attention slicing + vae tiling.
+
+Optimizado para RTX 3060 6 GB: fp16, xformers, attention slicing, vae tiling,
+y manejo automático de OOM con reintento a resolución reducida.
 """
 import logging
 import uuid
@@ -23,16 +28,15 @@ GEN_W, GEN_H = 1280, 720
 
 class VisualGenerator:
     """
-    Singleton que carga el pipeline de SD una vez y lo reutiliza.
-    Genera imágenes secuencialmente (6GB VRAM no permite batches grandes).
-    Incluye manejo automático de OOM con fallback a resolución reducida.
+    Singleton que carga el pipeline de JuggernautXL Lightning una vez y lo
+    reutiliza. Genera imágenes secuencialmente (6 GB VRAM no permite batches
+    grandes). En OOM reintenta automáticamente a resolución reducida.
     """
 
     def __init__(self):
         self._pipe = None
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
         self._dtype = torch.float16 if self._device == "cuda" else torch.float32
-        self._using_sdxl = True
         logger.info(f"VisualGenerator — device: {self._device}")
 
     def _load(self):
@@ -41,58 +45,38 @@ class VisualGenerator:
 
         from diffusers import (
             StableDiffusionXLPipeline,
-            StableDiffusionPipeline,
-            DPMSolverMultistepScheduler,
+            DPMSolverSinglestepScheduler,
         )
 
-        # Intentar SDXL primero, caer a SD 1.5 si falla
-        for model_id, is_sdxl in [
-            (settings.SD_MODEL, True),
-            (settings.SD_FALLBACK_MODEL, False),
-        ]:
+        logger.info(f"Cargando {settings.SD_MODEL} (primera vez: descarga ~6.6 GB)…")
+        pipe = StableDiffusionXLPipeline.from_pretrained(
+            settings.SD_MODEL,
+            torch_dtype=self._dtype,
+            use_safetensors=True,
+            variant="fp16" if self._device == "cuda" else None,
+        )
+
+        # Lightning requiere DPM++ SDE single-step para máxima calidad en 4-8 pasos.
+        # use_karras_sigmas=False es lo recomendado por el autor de Juggernaut Lightning.
+        pipe.scheduler = DPMSolverSinglestepScheduler.from_config(
+            pipe.scheduler.config,
+            use_karras_sigmas=False,
+        )
+
+        pipe = pipe.to(self._device)
+        pipe.enable_attention_slicing(slice_size="auto")
+        pipe.enable_vae_tiling()
+
+        if settings.SD_USE_XFORMERS:
             try:
-                logger.info(f"Cargando {model_id} (primera vez: descarga ~7GB)…")
-                if is_sdxl:
-                    pipe = StableDiffusionXLPipeline.from_pretrained(
-                        model_id,
-                        torch_dtype=self._dtype,
-                        use_safetensors=True,
-                        variant="fp16" if self._device == "cuda" else None,
-                    )
-                else:
-                    pipe = StableDiffusionPipeline.from_pretrained(
-                        model_id,
-                        torch_dtype=self._dtype,
-                        safety_checker=None,
-                        requires_safety_checker=False,
-                    )
+                pipe.enable_xformers_memory_efficient_attention()
+                logger.info("xformers activado ✅")
+            except Exception:
+                logger.warning("xformers no disponible — usando attention slicing")
 
-                pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-                    pipe.scheduler.config,
-                    use_karras_sigmas=True,
-                    algorithm_type="dpmsolver++",
-                )
-                pipe = pipe.to(self._device)
-                pipe.enable_attention_slicing(slice_size="auto")
-                pipe.enable_vae_tiling()
-
-                if settings.SD_USE_XFORMERS:
-                    try:
-                        pipe.enable_xformers_memory_efficient_attention()
-                        logger.info("xformers activado ✅")
-                    except Exception:
-                        logger.warning("xformers no disponible — usando attention slicing")
-
-                self._pipe = pipe
-                self._using_sdxl = is_sdxl
-                logger.info(f"Pipeline SD listo: {'SDXL' if is_sdxl else 'SD 1.5'} ✅")
-                return
-
-            except Exception as exc:
-                logger.warning(f"{model_id} falló: {exc} — probando fallback…")
-                torch.cuda.empty_cache()
-
-        raise RuntimeError("No se pudo cargar ningún modelo de Stable Diffusion.")
+        self._pipe = pipe
+        logger.info(f"Pipeline listo: JuggernautXL Lightning ✅ "
+                    f"(steps={settings.SD_STEPS}, cfg={settings.SD_GUIDANCE_SCALE})")
 
     def generate_one(
         self,
@@ -101,12 +85,12 @@ class VisualGenerator:
         output_path: Path,
         width: int = GEN_W,
         height: int = GEN_H,
-        steps: int = None,
+        steps: Optional[int] = None,
         seed: Optional[int] = None,
     ) -> Path:
         self._load()
         steps = steps or settings.SD_STEPS
-        # SDXL y SD requieren múltiplos de 8
+        # SDXL requiere múltiplos de 8
         width  = (width  // 8) * 8
         height = (height // 8) * 8
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -158,7 +142,7 @@ class VisualGenerator:
                 try:
                     results.append(self.generate_one(
                         p["positive"], p.get("negative", ""), out,
-                        width=768, height=432, steps=15,
+                        width=768, height=432, steps=max(settings.SD_STEPS, 6),
                     ))
                     logger.info(f"  [{i+1}/{len(prompts)}] OK (resolución reducida)")
                 except Exception as e2:
@@ -208,14 +192,16 @@ class VisualGenerator:
             for path, prompt_data in zip(paths, prompts):
                 asset = VisualAsset(
                     job_id=job_id,
-                    provider="stable-diffusion-local",
+                    provider="juggernaut-xl-lightning-local",
                     prompt=prompt_data["positive"],
                     file_path=str(path),
                     asset_type="image",
                     width=GEN_W,
                     height=GEN_H,
                     generation_metadata={
-                        "model": settings.SD_MODEL if self._using_sdxl else settings.SD_FALLBACK_MODEL,
+                        "model": settings.SD_MODEL,
+                        "steps": settings.SD_STEPS,
+                        "cfg": settings.SD_GUIDANCE_SCALE,
                         "subject": prompt_data.get("subject", ""),
                     },
                 )

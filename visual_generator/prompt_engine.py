@@ -1,5 +1,5 @@
 """
-Generates visual prompts for Stable Diffusion / Leonardo / Flux
+Generates visual prompts for JuggernautXL Lightning
 consistent with the music style and channel brand.
 """
 import random

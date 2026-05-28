@@ -1,6 +1,6 @@
 """
 Central configuration — all secrets from environment variables, never hardcoded.
-Todo el procesamiento de IA es local (MusicGen + Stable Diffusion).
+Todo el procesamiento de IA es local (MusicGen + JuggernautXL Lightning).
 """
 from pydantic_settings import BaseSettings
 from pydantic import Field
@@ -41,13 +41,14 @@ class Settings(BaseSettings):
     MUSICGEN_TOP_P: float = 0.0
     MUSICGEN_NATIVE_SR: int = 32000                               # MusicGen genera a 32 kHz
 
-    # ─── Stable Diffusion local ───────────────────────────────────────────────
-    SD_MODEL: str = "stabilityai/stable-diffusion-xl-base-1.0"
-    SD_FALLBACK_MODEL: str = "runwayml/stable-diffusion-v1-5"
-    SD_STEPS: int = 25
-    SD_GUIDANCE_SCALE: float = 7.5
+    # ─── Stable Diffusion local — JuggernautXL Lightning ─────────────────────
+    # Refinado SDXL de RunDiffusion: foto-realismo superior + scheduler Lightning
+    # (4-8 pasos en lugar de 25). Cabe en 6 GB de VRAM en fp16.
+    SD_MODEL: str = "RunDiffusion/Juggernaut-XL-Lightning"
+    SD_STEPS: int = 6                      # rango Lightning: 4-8
+    SD_GUIDANCE_SCALE: float = 2.0         # Lightning usa CFG bajo (1.5-3.0)
     SD_USE_XFORMERS: bool = True           # requiere xformers instalado
-    SD_HALF_PRECISION: bool = True         # fp16, obligatorio para 6GB VRAM
+    SD_HALF_PRECISION: bool = True         # fp16, obligatorio para 6 GB VRAM
 
     # ─── OpenAI (solo para SEO — títulos, descripciones, tags) ───────────────
     OPENAI_API_KEY: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")

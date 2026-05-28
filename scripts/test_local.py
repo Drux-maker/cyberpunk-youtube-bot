@@ -74,7 +74,7 @@ async def run(style_name: str, duration: int, skip_seo: bool):
     logger.info(f"VRAM tras descargar MusicGen: {gen_music.vram_usage()}")
 
     # ── Paso 2: Imágenes ──────────────────────────────────────────────────────
-    step(2, "STABLE DIFFUSION — Generando imágenes locales")
+    step(2, "JUGGERNAUT XL LIGHTNING — Generando imágenes locales")
     from visual_generator.generator import get_visual_generator
     gen_vis = get_visual_generator()
     logger.info(f"VRAM: {gen_vis.vram_usage()}")

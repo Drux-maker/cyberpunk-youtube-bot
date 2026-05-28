@@ -175,6 +175,23 @@ class VisualGenerator:
         total = torch.cuda.get_device_properties(0).total_memory / 1e9
         return f"{used:.1f}/{total:.1f}GB"
 
+    def unload(self) -> None:
+        """Libera VRAM tras generar todas las imágenes."""
+        if self._pipe is None:
+            return
+        import gc
+        try:
+            self._pipe.to("cpu")
+        except Exception:
+            pass
+        del self._pipe
+        self._pipe = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        logger.info("VisualGenerator descargado de VRAM")
+
     async def run_batch(
         self,
         job_id: int,

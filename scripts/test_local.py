@@ -69,6 +69,10 @@ async def run(style_name: str, duration: int, skip_seo: bool):
         audio_path = Path(asset.file_path)
     logger.info(f"Audio: {audio_path} ({audio_path.stat().st_size / 1e6:.1f}MB)")
 
+    # Liberar VRAM antes de cargar SDXL (crítico en GPUs de 6GB)
+    gen_music.unload()
+    logger.info(f"VRAM tras descargar MusicGen: {gen_music.vram_usage()}")
+
     # ── Paso 2: Imágenes ──────────────────────────────────────────────────────
     step(2, "STABLE DIFFUSION — Generando imágenes locales")
     from visual_generator.generator import get_visual_generator
@@ -80,6 +84,10 @@ async def run(style_name: str, duration: int, skip_seo: bool):
         print("ERROR: No se generaron imágenes. Abortando.")
         return
     logger.info(f"Imágenes: {len(image_paths)}")
+
+    # Liberar VRAM tras imágenes (ffmpeg/Pillow no la necesitan)
+    gen_vis.unload()
+    logger.info(f"VRAM tras descargar SDXL: {gen_vis.vram_usage()}")
 
     # ── Paso 3: Vídeo ─────────────────────────────────────────────────────────
     step(3, "VIDEO EDITOR — Ensamblando con FFmpeg")
@@ -134,6 +142,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     import torch
-    print(f"\n🎮 GPU: {'CUDA — ' + torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+    gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    print(f"\nGPU: {gpu}")
 
     asyncio.run(run(args.style, args.duration, args.no_seo))

@@ -33,22 +33,24 @@ from database.models import (
 
 
 # ─── Configuración de la tanda ───────────────────────────────────────────────
+# Duración bajada a 30 min para validar el lanzamiento robusto vía Task
+# Scheduler antes de comprometer 6 h en pistas de 1 h. Una vez confirmado,
+# subir a 3600 sin tocar nada más.
 JOBS = [
     # (channel_tag, MusicStyle, duration_seconds, n_images)
-    ("ironpulse", MusicStyle.INDUSTRIAL,  3600, 12),   # canal gym
-    ("deepstack", MusicStyle.DARK_TECHNO, 3600, 12),   # canal devs
+    ("ironpulse", MusicStyle.INDUSTRIAL,  1800, 8),   # canal gym (30 min)
+    ("deepstack", MusicStyle.DARK_TECHNO, 1800, 8),   # canal devs (30 min)
 ]
 
 
 # ─── Logging global ──────────────────────────────────────────────────────────
 settings.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+# El .bat wrapper redirige stdout+stderr al log; abrir el mismo archivo
+# desde Python causa PermissionError en Windows. Solo StreamHandler.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(str(settings.LOGS_DIR / "overnight.log"), encoding="utf-8"),
-    ],
+    handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger("overnight_av")
 

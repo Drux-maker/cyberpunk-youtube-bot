@@ -48,19 +48,51 @@ class VisualGenerator:
             DPMSolverSinglestepScheduler,
         )
 
-        logger.info(f"Cargando {settings.SD_MODEL} (primera vez: descarga ~6.6 GB)…")
-        pipe = StableDiffusionXLPipeline.from_pretrained(
-            settings.SD_MODEL,
-            torch_dtype=self._dtype,
-            use_safetensors=True,
-            variant="fp16" if self._device == "cuda" else None,
-        )
+        logger.info(f"Cargando {settings.SD_MODEL}…")
+        # Estrategia de carga: probamos las combinaciones más comunes en orden
+        # de preferencia. Para JuggernautXL Lightning lo que funciona es
+        # use_safetensors=False (el repo solo publica pytorch .bin); pero el
+        # mismo loader debe valer para otros modelos que SÍ publican
+        # safetensors fp16. Vamos del más eficiente al más permisivo.
+        attempts = [
+            # 1) Modelos modernos: safetensors + variant fp16 (mitad de tamaño)
+            {"variant": "fp16", "use_safetensors": True},
+            # 2) Modelos con safetensors pero sin variant fp16
+            {"use_safetensors": True},
+            # 3) JuggernautXL Lightning y otros que solo publican pytorch .bin
+            {"use_safetensors": False},
+        ]
+        if self._device != "cuda":
+            attempts = [{k: v for k, v in a.items() if k != "variant"} for a in attempts]
 
-        # Lightning requiere DPM++ SDE single-step para máxima calidad en 4-8 pasos.
-        # use_karras_sigmas=False es lo recomendado por el autor de Juggernaut Lightning.
+        pipe = None
+        last_exc: Exception | None = None
+        for opts in attempts:
+            try:
+                pipe = StableDiffusionXLPipeline.from_pretrained(
+                    settings.SD_MODEL,
+                    torch_dtype=self._dtype,
+                    **opts,
+                )
+                logger.info(f"SDXL cargado con opciones: {opts}")
+                break
+            except Exception as exc:
+                last_exc = exc
+                msg = str(exc)
+                # Truncar para que el log no estalle con tracebacks de diffusers
+                logger.warning(f"Carga con {opts} falló ({msg[:120]}…); probando siguiente…")
+        if pipe is None:
+            raise RuntimeError(f"No se pudo cargar {settings.SD_MODEL}. Último error: {last_exc}")
+
+        # Scheduler óptimo según el modelo:
+        # - Lightning models (pocos pasos, CFG bajo) → DPMSolverSinglestepScheduler
+        # - Modelos estándar SDXL (25 pasos, CFG ~7) → mismo scheduler en modo
+        #   multistep funciona, pero singlestep también es válido para Lightning.
+        # use_karras_sigmas=False es lo recomendado por el autor de Juggernaut LT.
+        is_lightning = "lightning" in settings.SD_MODEL.lower() or settings.SD_STEPS <= 10
         pipe.scheduler = DPMSolverSinglestepScheduler.from_config(
             pipe.scheduler.config,
-            use_karras_sigmas=False,
+            use_karras_sigmas=not is_lightning,
         )
 
         pipe = pipe.to(self._device)

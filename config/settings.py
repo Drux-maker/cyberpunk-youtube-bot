@@ -44,12 +44,15 @@ class Settings(BaseSettings):
     MUSICGEN_USE_MBD: bool = False
     MUSICGEN_USE_NEGATIVE_PROMPT: bool = True                     # CFG negative prompt para evitar "lo-fi"
 
-    # ─── Stable Diffusion local — JuggernautXL Lightning ─────────────────────
-    # Refinado SDXL de RunDiffusion: foto-realismo superior + scheduler Lightning
-    # (4-8 pasos en lugar de 25). Cabe en 6 GB de VRAM en fp16.
-    SD_MODEL: str = "RunDiffusion/Juggernaut-XL-Lightning"
-    SD_STEPS: int = 6                      # rango Lightning: 4-8
-    SD_GUIDANCE_SCALE: float = 2.0         # Lightning usa CFG bajo (1.5-3.0)
+    # ─── Stable Diffusion local — JuggernautXL v9 ────────────────────────────
+    # Refinado SDXL de RunDiffusion: foto-realismo superior al SDXL base.
+    # Elegimos la versión v9 (no Lightning) porque su repo SÍ publica
+    # safetensors fp16 oficiales — cabe en 6 GB VRAM al cargar directamente
+    # en fp16, sin malabarismos de conversión que provocaban segfault con
+    # la variante Lightning (que solo subía pytorch_model.bin en fp32).
+    SD_MODEL: str = "RunDiffusion/Juggernaut-XL-v9"
+    SD_STEPS: int = 25                     # 25 pasos: óptimo para SDXL base/refinados
+    SD_GUIDANCE_SCALE: float = 6.0         # CFG moderado para foto-realismo
     SD_USE_XFORMERS: bool = True           # requiere xformers instalado
     SD_HALF_PRECISION: bool = True         # fp16, obligatorio para 6 GB VRAM
 

@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     THUMBNAILS_DIR: Path = BASE_DIR / "assets" / "thumbnails"
     FONTS_DIR: Path = BASE_DIR / "assets" / "fonts"
     LOGS_DIR: Path = BASE_DIR / "logs"
+    CHANNEL_PROFILES_DIR: Path = BASE_DIR / "assets" / "channel_profiles"
 
     # ─── Database ─────────────────────────────────────────────────────────────
     DATABASE_URL: str = Field(default="sqlite:///./cyberpunk_bot.db", alias="DATABASE_URL")
@@ -59,6 +60,19 @@ class Settings(BaseSettings):
     # ─── OpenAI (solo para SEO — títulos, descripciones, tags) ───────────────
     OPENAI_API_KEY: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     OPENAI_MODEL: str = "gpt-4o-mini"
+
+    # ─── Anthropic (research layer — perfilado de canales) ───────────────────
+    ANTHROPIC_API_KEY: Optional[str] = Field(default=None, alias="ANTHROPIC_API_KEY")
+    CHANNEL_PROFILE_TTL_DAYS: int = 7      # tras N días, profile_channel pide refresh
+
+    # ─── Anthropic Claude (research layer — prompts comerciales) ─────────────
+    # Si está definida, intelligence/research.py consulta a Claude 1×/día por
+    # (canal, estilo) para generar prompts basados en conocimiento musical
+    # actualizado (productores, labels, escenas top de Beatport/Spotify).
+    # Sin esta key, prompt_engine cae al template hardcoded.
+    ANTHROPIC_API_KEY: Optional[str] = Field(default=None, alias="ANTHROPIC_API_KEY")
+    ANTHROPIC_MODEL: str = "claude-opus-4-7"            # research por canal — 1×/día, ~$0.05/call
+    RESEARCH_ENABLED: bool = True                       # master switch del research layer
 
     # ─── YouTube ──────────────────────────────────────────────────────────────
     YOUTUBE_CLIENT_ID: Optional[str] = Field(default=None, alias="YOUTUBE_CLIENT_ID")

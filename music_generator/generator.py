@@ -429,10 +429,13 @@ class MusicGenerator:
         job_id: int,
         style: MusicStyle,
         duration_seconds: int,
+        channel_key: str | None = None,
     ) -> int:
         """Hasta 3 variaciones de prompt antes de fallar."""
         import asyncio
-        variations = build_music_prompt_variations(style, duration_seconds, count=3)
+        variations = build_music_prompt_variations(
+            style, duration_seconds, count=3, channel_key=channel_key,
+        )
         last_error = None
 
         for attempt, v in enumerate(variations):

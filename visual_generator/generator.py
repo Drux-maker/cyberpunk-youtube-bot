@@ -213,9 +213,10 @@ class VisualGenerator:
         job_id: int,
         style: MusicStyle,
         n_images: int = 8,
+        channel_key: str | None = None,
     ) -> list[int]:
         """Genera `n_images` imágenes y las guarda como VisualAssets. Devuelve IDs."""
-        prompts = build_visual_batch(style, n_images)
+        prompts = build_visual_batch(style, n_images, channel_key=channel_key)
         output_dir = settings.VISUALS_DIR / str(job_id)
         paths = self.generate_batch(prompts, output_dir)
 

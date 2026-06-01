@@ -107,32 +107,95 @@ NEGATIVE_PROMPT = (
 )
 
 
-def build_visual_prompt(style: MusicStyle, custom_subject: str | None = None) -> dict:
+def _load_channel_visual_profile(channel_key: str | None):
+    """Carga el perfil visual del canal si existe y no caducó. None en otro caso."""
+    if channel_key is None:
+        return None
+    try:
+        from research import get_channel_profile
+        profile = get_channel_profile(channel_key)
+        return profile.visual if profile else None
+    except Exception:
+        return None
+
+
+def build_visual_prompt(
+    style: MusicStyle,
+    custom_subject: str | None = None,
+    channel_key: str | None = None,
+) -> dict:
+    """
+    Construye un prompt para JuggernautXL.
+
+    Si `channel_key` apunta a un canal con perfil cacheado, los descriptores
+    visuales del perfil ENRIQUECEN el prompt (sujetos del canal con prioridad,
+    iluminación, paleta, composición y referencias específicas del nicho).
+    Si no, se usa el template hardcoded — degradación silenciosa.
+    """
     template = STYLE_VISUAL_MAP[style]
-    subject = custom_subject or random.choice(template["subjects"])
+    visual_profile = _load_channel_visual_profile(channel_key)
+
+    # Sujeto: si hay perfil, alternar entre sujetos del canal y del estilo
+    if custom_subject is not None:
+        subject = custom_subject
+    elif visual_profile is not None and random.random() < 0.7:
+        # 70% sujetos del perfil del canal — más relevantes para la tribu
+        subject = random.choice(visual_profile.primary_subjects)
+    else:
+        subject = random.choice(template["subjects"])
+
     quality = random.choice(QUALITY_SUFFIXES)
 
-    positive = (
-        f"{subject}, {template['base']}, "
-        f"color palette: {template['color_palette']}, "
-        f"atmosphere: {template['atmosphere']}, "
-        f"{quality}"
-    )
+    if visual_profile is not None:
+        # El perfil sobrescribe paleta/atmósfera/composición con datos hyper-específicos
+        positive = (
+            f"{subject}, "
+            f"lighting: {visual_profile.lighting}, "
+            f"color palette: {', '.join(visual_profile.palette)}, "
+            f"composition: {visual_profile.composition}, "
+            f"reference: {random.choice(visual_profile.references)}, "
+            f"{quality}"
+        )
+        negative = NEGATIVE_PROMPT + ", " + ", ".join(visual_profile.avoid)
+    else:
+        positive = (
+            f"{subject}, {template['base']}, "
+            f"color palette: {template['color_palette']}, "
+            f"atmosphere: {template['atmosphere']}, "
+            f"{quality}"
+        )
+        negative = NEGATIVE_PROMPT
 
     return {
         "positive": positive,
-        "negative": NEGATIVE_PROMPT,
+        "negative": negative,
         "style": style.value,
         "subject": subject,
     }
 
 
-def build_visual_batch(style: MusicStyle, count: int = 5) -> list[dict]:
-    """Generate diverse prompts for a batch of visuals (one video needs ~5-10 key frames)."""
-    template = STYLE_VISUAL_MAP[style]
-    subjects = random.sample(template["subjects"], k=min(count, len(template["subjects"])))
-    # If count > subjects, repeat with variation
-    while len(subjects) < count:
-        subjects.append(random.choice(template["subjects"]) + f", from a different angle, dynamic perspective")
+def build_visual_batch(
+    style: MusicStyle,
+    count: int = 5,
+    channel_key: str | None = None,
+) -> list[dict]:
+    """
+    Generate diverse prompts for a batch of visuals.
 
-    return [build_visual_prompt(style, subject) for subject in subjects]
+    Si se pasa `channel_key`, los sujetos del perfil del canal entran a la
+    rotación junto a los sujetos del template del estilo, garantizando que
+    cada imagen tenga un sujeto distinto.
+    """
+    template = STYLE_VISUAL_MAP[style]
+    visual_profile = _load_channel_visual_profile(channel_key)
+
+    # Pool de sujetos: estilo + canal (si hay perfil)
+    pool = list(template["subjects"])
+    if visual_profile is not None:
+        pool = list(visual_profile.primary_subjects) + pool
+
+    subjects = random.sample(pool, k=min(count, len(pool)))
+    while len(subjects) < count:
+        subjects.append(random.choice(pool) + ", from a different angle, dynamic perspective")
+
+    return [build_visual_prompt(style, subject, channel_key=channel_key) for subject in subjects]

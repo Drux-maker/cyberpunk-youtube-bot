@@ -100,7 +100,7 @@ async def run_one(channel_tag: str, style: MusicStyle, duration: int, n_images: 
         gen_music = get_music_generator()
         logger.info(f"[{channel_tag}] VRAM antes música: {gen_music.vram_usage()}")
         t_m = time.time()
-        asset_id = await gen_music.run_with_retry(job_id, style, duration)
+        asset_id = await gen_music.run_with_retry(job_id, style, duration, channel_key=channel_tag)
         result["music_seconds"] = time.time() - t_m
         with get_db() as db:
             asset = db.query(MusicAsset).filter(MusicAsset.id == asset_id).first()
@@ -122,7 +122,7 @@ async def run_one(channel_tag: str, style: MusicStyle, duration: int, n_images: 
         gen_vis = get_visual_generator()
         logger.info(f"[{channel_tag}] VRAM antes visuals: {gen_vis.vram_usage()}")
         t_v = time.time()
-        asset_ids = await gen_vis.run_batch(job_id, style, n_images)
+        asset_ids = await gen_vis.run_batch(job_id, style, n_images, channel_key=channel_tag)
         result["visuals_seconds"] = time.time() - t_v
         with get_db() as db:
             assets = db.query(VisualAsset).filter(VisualAsset.id.in_(asset_ids)).all()

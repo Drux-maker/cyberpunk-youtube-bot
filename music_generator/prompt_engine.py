@@ -137,6 +137,20 @@ def _tempo_phrase(template: dict, bpm: int) -> str:
     return template["tempo_phrase"].format(bpm=bpm)
 
 
+def _load_channel_music_profile(channel_key: str | None):
+    """Carga el perfil musical del canal si existe y no caducó. None en otro caso."""
+    if channel_key is None:
+        return None
+    try:
+        from research import get_channel_profile
+        profile = get_channel_profile(channel_key)
+        return profile.music if profile else None
+    except Exception:
+        # Si la capa research no está disponible (sin anthropic instalado o sin
+        # API key), nos caemos al template hardcoded sin romper el pipeline.
+        return None
+
+
 def build_music_prompt(
     style: MusicStyle,
     duration_seconds: int,
@@ -145,6 +159,7 @@ def build_music_prompt(
     custom_elements: list[str] | None = None,
     elements: list[str] | None = None,
     reference: str | None = None,
+    channel_key: str | None = None,
 ) -> tuple[str, int]:
     """
     Build a single MusicGen prompt.
@@ -152,29 +167,59 @@ def build_music_prompt(
     `section` opcional: "intro" | "buildup" | "peak" | "sustain" | "outro".
     `elements` y `reference` opcionales: si se pasan, se reutilizan tal cual
     (clave para long-form: evita que la instrumentación cambie cada 30s).
-    Si son None, se muestrean aleatoriamente del template.
+    `channel_key` opcional: si hay un perfil cacheado para ese canal, sus
+    descriptores SOBRESCRIBEN los del template hardcoded (BPM, elementos,
+    artistas/labels, keywords de producción). Si no hay perfil válido, se
+    usa el template tal cual — degradación silenciosa.
     """
     template = STYLE_TEMPLATES[style]
+    channel_profile = _load_channel_music_profile(channel_key)
 
     if bpm is None:
-        bpm = random.randint(*template["bpm_range"])
+        if channel_profile is not None:
+            bpm = random.randint(*channel_profile.bpm_range)
+        else:
+            bpm = random.randint(*template["bpm_range"])
 
     if elements is None:
-        elements = random.sample(template["elements"], k=min(3, len(template["elements"])))
+        if channel_profile is not None:
+            # Tomar todos los must_have_elements del perfil (4-10 items)
+            elements = random.sample(
+                channel_profile.must_have_elements,
+                k=min(4, len(channel_profile.must_have_elements)),
+            )
+        else:
+            elements = random.sample(template["elements"], k=min(3, len(template["elements"])))
     else:
         elements = list(elements)
     if custom_elements:
         elements.extend(custom_elements)
 
-    ref = reference if reference is not None else random.choice(template["references"])
+    if reference is not None:
+        ref = reference
+    elif channel_profile is not None:
+        # 70% artista, 30% label — los dos son señales fuertes para MusicGen
+        if random.random() < 0.7:
+            ref = random.choice(channel_profile.reference_artists)
+        else:
+            ref = f"{random.choice(channel_profile.reference_labels)} label"
+    else:
+        ref = random.choice(template["references"])
+
     tempo = _tempo_phrase(template, bpm)
+
+    # Keywords de producción: si hay perfil, usar los suyos; si no, los hardcoded
+    if channel_profile is not None:
+        production_kw = ", ".join(channel_profile.production_keywords)
+    else:
+        production_kw = PRO_PRODUCTION_KEYWORDS
 
     parts = [
         template["base"],
         tempo,
         ", ".join(elements),
         f"in the style of {ref}",
-        PRO_PRODUCTION_KEYWORDS,
+        production_kw,
         "instrumental, no vocals",
     ]
     if section and section in ENERGY_SECTIONS:
@@ -183,8 +228,15 @@ def build_music_prompt(
     return ", ".join(parts), bpm
 
 
-def get_negative_prompt() -> str:
-    """Negative prompt común para todos los estilos — usado vía dual-CFG."""
+def get_negative_prompt(channel_key: str | None = None) -> str:
+    """
+    Negative prompt para dual-CFG. Si se pasa un channel_key con perfil
+    válido en caché, se concatenan los descriptores 'negative' del perfil
+    al negative común — anti-patterns específicos del nicho.
+    """
+    profile_music = _load_channel_music_profile(channel_key)
+    if profile_music is not None and profile_music.negative:
+        return NEGATIVE_PROMPT + ", " + ", ".join(profile_music.negative)
     return NEGATIVE_PROMPT
 
 
@@ -192,11 +244,12 @@ def build_music_prompt_variations(
     style: MusicStyle,
     duration_seconds: int,
     count: int = 3,
+    channel_key: str | None = None,
 ) -> list[dict]:
     """Multiple full-track prompt variations for retry logic."""
     variations = []
     for _ in range(count):
-        prompt, bpm = build_music_prompt(style, duration_seconds)
+        prompt, bpm = build_music_prompt(style, duration_seconds, channel_key=channel_key)
         variations.append({
             "prompt": prompt,
             "bpm": bpm,
